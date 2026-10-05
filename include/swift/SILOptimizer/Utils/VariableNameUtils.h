@@ -1,0 +1,426 @@
+//===--- VariableNameUtils.h ----------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+///
+/// Utilities for inferring the name of a value.
+///
+//===----------------------------------------------------------------------===//
+
+#ifndef SWIFT_SILOPTIMIZER_UTILS_VARIABLENAMEUTILS_H
+#define SWIFT_SILOPTIMIZER_UTILS_VARIABLENAMEUTILS_H
+
+#include "swift/Basic/Defer.h"
+#include "swift/Basic/OptionSet.h"
+#include "swift/SIL/ApplySite.h"
+#include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/MemAccessUtils.h"
+#include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/StackList.h"
+
+#include <variant>
+
+namespace swift {
+
+class VariableNameInferrer {
+public:
+  enum class Flag {
+    /// If set then we should look through get and set accessors and infer their
+    /// name from self.
+    ///
+    /// DISCUSSION: This may not be the correct semantics for all name inference
+    /// since we may want to consider computed properties to be tied to self.
+    InferSelfThroughAllAccessors = 0x1,
+
+    /// If set then when a call's result is bound directly to a variable, name
+    /// the result after the call that produced it -- spelled `foo()` -- rather
+    /// than after the variable being initialized.
+    ///
+    /// DISCUSSION: By default the inferrer prefers the variable, since that is
+    /// the name the user wrote for the value. A client explaining where a value
+    /// came from rather than what it is now wants the opposite, and wants the
+    /// name to read as the *result of calling* the function, not as a value
+    /// that merely shares the function's name. This only applies to the
+    /// `let x = foo()` shape, where the variable's name would otherwise be
+    /// taken from the initializing move_value [var_decl]; it does not change
+    /// how a value that is merely passed around is named.
+    NameCallResultAfterCallee = 0x2,
+  };
+
+  using Options = OptionSet<Flag>;
+
+  /// One element of the path the inferrer accumulates as it walks. Each
+  /// component records the \c subject it is naming (a textual \c StringRef
+  /// for sources without a recoverable decl, e.g. a debug_value's name
+  /// attribute or a tuple-element index; a \c ValueDecl* when one is
+  /// available, e.g. for the callee of an \c apply or a stored property
+  /// being projected). Consumers that only need a rendered string call
+  /// \c text(); consumers that want decl-aware diagnostics (\c %kind etc.)
+  /// can match on the variant directly.
+  struct InferredNameComponent {
+    std::variant<StringRef, ValueDecl *> subject;
+
+    /// Source location associated with this component (e.g., a let-binding's
+    /// decl loc or an apply's call loc). Used for diagnostic anchoring.
+    SourceLoc providingLoc;
+
+    InferredNameComponent(StringRef name, SourceLoc loc)
+        : subject(name), providingLoc(loc) {}
+    InferredNameComponent(ValueDecl *decl, SourceLoc loc)
+        : subject(decl), providingLoc(loc) {}
+
+    /// Render this component as the textual fragment used to build the
+    /// joined name path. Used by \c drainVariableNamePath.
+    StringRef getStringRef() const;
+  };
+
+private:
+  /// A two phase stack data structure. The first phase only allows for two
+  /// operations:
+  ///
+  /// 1. pushing elements onto the stack.
+  /// 2. pushing/popping a "snapshot" of the stack (see description below).
+  ///
+  /// The second phase only allows for the stack to be drained.
+  ///
+  /// DISCUSSION: The snapshot operation stashes the current size of the
+  /// variable name path array when the snapshot operation occurs. If one pops
+  /// the snapshot, the data structure sets its current insertion point to be
+  /// the old stack point effectively popping off all of the elements of the
+  /// stack until the last snapshot. This is useful when working with things
+  /// like phis where one wants to speculatively push items onto this stack
+  /// while discovering if one has an actual interesting value from the phi. If
+  /// one fails to find something interesting, then one can just pop the
+  /// snapshot and go process the next phi incoming value.
+  template <typename T, unsigned SmallSize>
+  class VariableNamePathArray {
+    SmallVector<T, SmallSize> data;
+
+    unsigned lastSnapShotIndex = 0;
+    unsigned insertionPointIndex = 0;
+
+  public:
+    VariableNamePathArray() : data() {}
+
+    ArrayRef<T> getData() const {
+      assert(insertionPointIndex <= data.size());
+      return ArrayRef<T>(data).take_front(insertionPointIndex);
+    }
+
+    void print(llvm::raw_ostream &os) const {
+      os << "LastSnapShotIndex: " << lastSnapShotIndex << '\n';
+      os << "InsertionPointIndex: " << insertionPointIndex << '\n';
+    }
+
+    SWIFT_DEBUG_DUMP { print(llvm::dbgs()); }
+
+    /// Pushes a snapshot and returns the old index.
+    unsigned pushSnapShot() & {
+      // After we run with a snapshot, we want:
+      //
+      // 1. lastSnapShotIndex to return to its value before the continuation
+      // ran.
+      // 2. The insertion point index becomes lastSnapShotIndex.
+      unsigned oldSnapShotIndex = lastSnapShotIndex;
+      lastSnapShotIndex = insertionPointIndex;
+      return oldSnapShotIndex;
+    }
+
+    void popSnapShot(unsigned oldIndex) & {
+      insertionPointIndex = lastSnapShotIndex;
+      lastSnapShotIndex = oldIndex;
+    }
+
+    void returnSnapShot(unsigned oldIndex) & { lastSnapShotIndex = oldIndex; }
+
+    void push_back(const T &newValue) & {
+      SWIFT_DEFER { assert(insertionPointIndex <= data.size()); };
+      if (insertionPointIndex == data.size()) {
+        data.push_back(newValue);
+        ++insertionPointIndex;
+        return;
+      }
+
+      data[insertionPointIndex] = newValue;
+      ++insertionPointIndex;
+    }
+
+    [[nodiscard]] T pop_back_val() & {
+      SWIFT_DEFER { assert(insertionPointIndex <= data.size()); };
+      assert(!lastSnapShotIndex &&
+             "Can only pop while lastSnapShotIndex is not set");
+      --insertionPointIndex;
+      return data[insertionPointIndex];
+    }
+
+    bool empty() const { return !insertionPointIndex; }
+  };
+
+  /// ASTContext for forming identifiers when we need to.
+  ASTContext &astContext;
+
+  /// The stacklist that we use to print out variable names.
+  ///
+  /// Has to be a small vector since we push/pop the last segment start. This
+  /// lets us speculate when processing phis.
+  VariableNamePathArray<InferredNameComponent, 4> variableNamePath;
+
+  /// The root value of our string.
+  ///
+  /// If set, a diagnostic should do a 'root' is defined here error.
+  SILValue rootValue;
+
+  /// The source location of the first (leaf-most) component pushed onto
+  /// \c variableNamePath. Since we walk use->def, the first push corresponds
+  /// to the deepest projection in the access path -- e.g., for "self.x.y"
+  /// this is the loc of the projection producing `y`. This is useful for
+  /// diagnostics that want the source location of the leaf access rather
+  /// than the root variable's location (which for a stored property accessed
+  /// in an init can be on the `init` keyword, far from the access).
+  SourceLoc firstNameProvidingLoc;
+
+  /// The leaf component's \c ValueDecl, if any. Captured by
+  /// \c drainVariableNamePath right before it consumes the path so callers
+  /// can recover decl-kind-aware info after a successful inference. Null
+  /// when no path was pushed or when the leaf component was a bare
+  /// \c StringRef (e.g. a tuple-element index, or a debug_value's name
+  /// attribute that didn't carry a decl).
+  ValueDecl *leafDecl = nullptr;
+
+  /// Set when the inferred name names a call rather than a variable -- i.e.
+  /// when \c Flag::NameCallResultAfterCallee applied and the name is the
+  /// spelling of the callee. A consumer needs this to phrase the name as the
+  /// *result of* that call; the name itself only says which call it was.
+  bool nameIsCallResult = false;
+
+  /// The final string we computed.
+  SmallString<64> &resultingString;
+
+  /// Options that control how we do our walk.
+  ///
+  /// Example: In certain cases we may want to impute self as a name for
+  /// computed getters/setters and in other cases we may not want to.
+  Options options;
+
+public:
+  VariableNameInferrer(SILFunction *fn, SmallString<64> &resultingString)
+      : astContext(fn->getASTContext()), variableNamePath(),
+        resultingString(resultingString) {}
+
+  VariableNameInferrer(SILFunction *fn, Options options,
+                       SmallString<64> &resultingString)
+      : astContext(fn->getASTContext()), variableNamePath(),
+        resultingString(resultingString), options(options) {}
+
+  /// Attempts to infer a name from just uses of \p searchValue.
+  ///
+  /// Returns true if we found a name.
+  bool tryInferNameFromUses(SILValue searchValue) {
+    auto *use = getAnyDebugUse(searchValue);
+    if (!use)
+      return false;
+
+    auto debugVar = DebugVarCarryingInst(use->getUser());
+    if (!debugVar)
+      return false;
+
+    assert(debugVar.getKind() == DebugVarCarryingInst::Kind::DebugValue);
+    resultingString += debugVar.getName();
+    return true;
+  }
+
+  /// See if \p searchValue or one of its defs (walking use->def) has a name
+  /// that we can use.
+  ///
+  /// \p failInsteadOfEmittingUnknown set to true if we should return false
+  /// rather than emitting unknown (and always succeeding).
+  ///
+  /// \returns true if we inferred anything. Returns false otherwise.
+  bool inferByWalkingUsesToDefs(SILValue searchValue) {
+    // Look up our root value while adding to the variable name path list.
+    auto rootValue = findDebugInfoProvidingValue(searchValue);
+    if (!rootValue) {
+      // If we do not pattern match successfully, just set resulting string to
+      // unknown and return early.
+      resultingString += "unknown";
+      return true;
+    }
+
+    drainVariableNamePath();
+    return true;
+  }
+
+  /// Infers the value that provides the debug info. This can be something like
+  /// an alloc_stack that provides the information directly or a value that has
+  /// a debug_value as a user.
+  ///
+  /// \returns SILValue() if we did not find anything.
+  SILValue inferByWalkingUsesToDefsReturningRoot(SILValue searchValue) {
+    // Look up our root value while adding to the variable name path list.
+    auto rootValue = findDebugInfoProvidingValue(searchValue);
+    if (!rootValue) {
+      // If we do not pattern match successfully, return SILValue() early.
+      return SILValue();
+    }
+
+    drainVariableNamePath();
+    return rootValue;
+  }
+
+  StringRef getName() const { return resultingString; }
+
+  SWIFT_DEBUG_DUMP { llvm::dbgs() << getName() << '\n'; }
+
+  /// Given a specific SILValue, construct a VariableNameInferrer and use it to
+  /// attempt to infer an identifier for the value.
+  static std::optional<Identifier> inferName(SILValue value);
+
+  /// Given a specific SILValue, construct a VariableNameInferrer and use it to
+  /// attempt to infer an identifier for the value and a named value.
+  static std::optional<std::pair<Identifier, SILValue>>
+  inferNameAndRoot(SILValue value);
+
+  /// Like \c inferName, but additionally returns the source location of the
+  /// first (leaf-most) component pushed onto the name path -- i.e., the
+  /// deepest projection in the access path. For "self.x.y" this is the loc
+  /// of the SILValue projecting `y`. Useful when a diagnostic wants the
+  /// source location of the leaf access rather than the root variable's
+  /// location.
+  ///
+  /// Returns std::nullopt if no name could be inferred. The returned
+  /// SourceLoc may be invalid when the inferred name has no associated
+  /// providing source location (e.g., a single-component name coming
+  /// directly from a debug_value with no usable loc).
+  ///
+  /// \p extraOptions additional inference options to apply on top of the
+  /// defaults this helper uses, for clients that want a different naming
+  /// policy (e.g. \c Flag::NameCallResultAfterCallee).
+  ///
+  /// \p nameIsCallResult if non-null, set to true when the returned name names
+  /// a call (see \c Flag::NameCallResultAfterCallee) rather than a variable, so
+  /// the caller can phrase it as the result of that call.
+  static std::optional<std::pair<Identifier, SourceLoc>>
+  inferNameAndFirstPathComponent(SILValue value, Options extraOptions = {},
+                                 bool *nameIsCallResult = nullptr);
+
+  /// Result of \c inferNameAndLeafDecl. Carries the joined+interned name,
+  /// the first-name-providing source location (see \c firstNameProvidingLoc),
+  /// and the leaf-most component's \c ValueDecl when one was recorded by
+  /// the walk (otherwise \c leafDecl is null).
+  struct InferredNameAndLeafDecl {
+    Identifier name;
+    SourceLoc declLoc;
+    ValueDecl *leafDecl;
+  };
+
+  /// Like \c inferNameAndFirstPathComponent, but also returns the leaf
+  /// component's \c ValueDecl when the inferrer recorded one (e.g. the
+  /// callee \c FuncDecl for a value that originates from an apply, or the
+  /// stored-property \c VarDecl for a struct-extract chain). Diagnostic
+  /// consumers can check \c leafDecl to pick a \c %kind-bearing variant
+  /// rather than printing the leaf's basename as if it were a bare value
+  /// identifier.
+  static std::optional<InferredNameAndLeafDecl>
+  inferNameAndLeafDecl(SILValue value);
+
+  /// Returns the source location whose name was first pushed onto the name
+  /// path during the walk. See \c firstNameProvidingLoc for details.
+  SourceLoc getFirstNameProvidingLoc() const { return firstNameProvidingLoc; }
+
+  /// Whether the inferred name names a call rather than a variable. See
+  /// \c nameIsCallResult.
+  bool isNameACallResult() const { return nameIsCallResult; }
+
+  /// Returns the leaf-most component's \c ValueDecl if \c drainVariableNamePath
+  /// has run on a non-empty path whose leaf was a decl, otherwise null.
+  /// Useful for diagnostics that want decl-kind-aware rendering (\c %kind)
+  /// rather than treating the inferred name as a bare value identifier
+  /// (e.g. a function called inline whose function_ref leaked through name
+  /// inference as if it were a variable name).
+  ValueDecl *getLeafDecl() const { return leafDecl; }
+
+  /// Given a specific decl \p d, come up with a name for it.
+  ///
+  /// This is used internally for translating all decls to names. This is
+  /// exposed in case someone wants to wrap VariableNameUtils and needs to use
+  /// the same internal mapping that VariableNameUtils uses.
+  static StringRef getNameFromDecl(Decl *d);
+
+private:
+  /// Helper that names the result of a call (apply / try_apply / begin_apply),
+  /// looking through partial_apply / conversions to the underlying callee and
+  /// walking into self to produce 'self.member'. Defined out-of-line in
+  /// VariableNameUtils.cpp. Holds a back-reference to its owning inferrer so it
+  /// can push path components and stash state across queries.
+  struct CallResultNamer;
+
+  void drainVariableNamePath();
+
+  /// Push \p name onto the variable name path, recording \p providingLoc
+  /// as the first name-providing source location if none has been recorded
+  /// yet.
+  void pushPathComponent(StringRef name, SourceLoc providingLoc) {
+    variableNamePath.push_back({name, providingLoc});
+    if (firstNameProvidingLoc.isInvalid())
+      firstNameProvidingLoc = providingLoc;
+  }
+
+  /// Decl-bearing overload of \c pushPathComponent: preserves \p decl in the
+  /// component's \c subject so consumers (e.g. \c %kind diagnostics) can
+  /// recover decl-kind-aware rendering. \c getStringRef() falls back to the
+  /// decl's base-name text for callers that only want a string.
+  void pushPathComponent(ValueDecl *decl, SourceLoc providingLoc) {
+    variableNamePath.push_back({decl, providingLoc});
+    if (firstNameProvidingLoc.isInvalid())
+      firstNameProvidingLoc = providingLoc;
+  }
+
+  /// Convenience overloads that take a \c SILLocation and extract its
+  /// \c SourceLoc. Most callers have a SILLocation in hand (e.g. from
+  /// \c getLoc()) and would otherwise repeat \c .getSourceLoc() at every
+  /// call site.
+  void pushPathComponent(StringRef name, SILLocation providingLoc) {
+    pushPathComponent(name, providingLoc.getSourceLoc());
+  }
+  void pushPathComponent(ValueDecl *decl, SILLocation providingLoc) {
+    pushPathComponent(decl, providingLoc.getSourceLoc());
+  }
+
+  /// Finds the SILValue that either provides the direct debug information or
+  /// that has a debug_value user that provides the name of the value.
+  SILValue findDebugInfoProvidingValue(SILValue searchValue);
+
+  /// Do not call this directly. Used just to improve logging for
+  /// findDebugInfoProvidingValue.
+  SILValue findDebugInfoProvidingValueHelper(SILValue searchValue,
+                                             ValueSet &visitedValues);
+
+  /// A special helper for handling phi values. Do not call this directly.
+  SILValue findDebugInfoProvidingValuePhiArg(SILValue incomingValue,
+                                             ValueSet &visitedValues);
+
+  /// Given an initialized once allocation inst without a ValueDecl or a
+  /// DebugVariable provided name, attempt to find a root value from its
+  /// initialization.
+  SILValue getRootValueForTemporaryAllocation(AllocationInst *allocInst);
+
+  StringRef getStringRefForIndex(unsigned index) const {
+    llvm::SmallString<64> indexString;
+    {
+      llvm::raw_svector_ostream stream(indexString);
+      stream << index;
+    }
+    return astContext.getIdentifier(indexString).str();
+  }
+};
+
+} // namespace swift
+
+#endif

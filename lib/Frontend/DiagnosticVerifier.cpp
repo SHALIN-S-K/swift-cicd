@@ -1,0 +1,2305 @@
+//===--- DiagnosticVerifier.cpp - Diagnostic Verifier (-verify) -----------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+//
+//  This file implements the DiagnosticVerifier class.
+//
+//===----------------------------------------------------------------------===//
+
+#include "swift/Frontend/DiagnosticVerifier.h"
+#include "swift/AST/Attr.h"
+#include "swift/AST/DiagnosticConsumer.h"
+#include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/ColorUtils.h"
+#include "swift/Basic/SourceManager.h"
+#include "swift/Parse/Lexer.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/ScopedPrinter.h"
+#include "llvm/Support/raw_ostream.h"
+#include <optional>
+
+using namespace swift;
+
+const DiagnosticKind DiagnosticKindExpansion = DiagnosticKind((int)DiagnosticKind::Note + 1);
+
+/// Indicates that the source location the buffer was derived from was invalid
+/// (i.e. would be printed as \c <unknown>:0 ).
+constexpr unsigned InvalidBufferID = 0;
+
+namespace {
+
+struct ExpectedCheckMatchStartParser {
+  StringRef MatchStart;
+  const char *ClassificationStartLoc = nullptr;
+  std::optional<DiagnosticKind> ExpectedClassification;
+
+  ExpectedCheckMatchStartParser(StringRef MatchStart)
+      : MatchStart(MatchStart) {}
+
+  bool tryParseClassification() {
+    if (MatchStart.starts_with("note")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Note;
+      MatchStart = MatchStart.substr(strlen("note"));
+      return true;
+    }
+
+    if (MatchStart.starts_with("warning")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Warning;
+      MatchStart = MatchStart.substr(strlen("warning"));
+      return true;
+    }
+
+    if (MatchStart.starts_with("error")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Error;
+      MatchStart = MatchStart.substr(strlen("error"));
+      return true;
+    }
+
+    if (MatchStart.starts_with("remark")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKind::Remark;
+      MatchStart = MatchStart.substr(strlen("remark"));
+      return true;
+    }
+
+    if (MatchStart.starts_with("expansion")) {
+      ClassificationStartLoc = MatchStart.data();
+      ExpectedClassification = DiagnosticKindExpansion;
+      MatchStart = MatchStart.substr(strlen("expansion"));
+      return true;
+    }
+
+    return false;
+  }
+
+  bool parse(ArrayRef<std::string> prefixes) {
+    // First try to parse as if we did not have a prefix. We always parse at
+    // least expected-*.
+    if (tryParseClassification())
+      return true;
+
+    // Otherwise, walk our prefixes until we find one that matches and attempt
+    // to check for a note, warning, error, or remark.
+    //
+    // TODO: We could make this more flexible, but this should work in the
+    // short term.
+    for (auto &p : prefixes) {
+      if (MatchStart.starts_with(p)) {
+        MatchStart = MatchStart.substr(p.size());
+        return tryParseClassification();
+      }
+    }
+
+    return false;
+  }
+};
+
+} // anonymous namespace
+
+namespace swift {
+
+struct ExpectedFixIt {
+  const char *StartLoc, *EndLoc; // The loc of the {{ and }}'s.
+  LineColumnRange Range;
+
+  std::string Text;
+};
+
+struct DiagLoc {
+  unsigned bufferID;
+  unsigned line;
+  unsigned column;
+  SourceLoc sourceLoc;
+
+  DiagLoc(SourceManager &diagSM, SourceManager &verifierSM,
+          SourceLoc initialSourceLoc, bool wantEnd = false)
+      : bufferID(InvalidBufferID), line(0), column(0),
+        sourceLoc(initialSourceLoc)
+  {
+    if (sourceLoc.isInvalid())
+      // Diagnostics at <unknown>:0 are given the invalid buffer ID and line and
+      // column zero.
+      return;
+
+    // Walk out of generated code for macros in default arguments so that we
+    // register diagnostics emitted in them at the call site instead.
+    while (true) {
+      bufferID = diagSM.findBufferContainingLoc(sourceLoc);
+
+      auto generatedInfo = diagSM.getGeneratedSourceInfo(bufferID);
+      if (!generatedInfo || generatedInfo->originalSourceRange.isInvalid()
+            || generatedInfo->kind != GeneratedSourceInfo::DefaultArgument)
+        break;
+
+      if (wantEnd)
+        sourceLoc = generatedInfo->originalSourceRange.getEnd();
+      else
+        sourceLoc = generatedInfo->originalSourceRange.getStart();
+
+      ASSERT(sourceLoc.isValid());
+    }
+
+    // If this diagnostic came from a different SourceManager (as can happen
+    // while compiling a module interface), translate its SourceLoc to match the
+    // verifier's SourceManager.
+    if (&diagSM != &verifierSM) {
+      sourceLoc = verifierSM.getLocForForeignLoc(sourceLoc, diagSM);
+      bufferID = verifierSM.findBufferContainingLoc(sourceLoc);
+    }
+
+    // At this point, `bufferID` is filled in and `sourceLoc` is a location in
+    // that buffer.
+    if (sourceLoc.isValid())
+      std::tie(line, column) = verifierSM.getLineAndColumnInBuffer(sourceLoc);
+  }
+};
+
+} // end namespace swift
+
+const LineColumnRange &
+CapturedFixItInfo::getLineColumnRange(SourceManager &SM) const {
+  if (LineColRange.StartLine != 0) {
+    // Already computed.
+    return LineColRange;
+  }
+
+  auto SrcRange = FixIt.getRange();
+
+  DiagLoc startLoc(*diagSM, SM, SrcRange.getStart());
+  LineColRange.StartLine = startLoc.line;
+  LineColRange.StartCol = startLoc.column;
+
+  DiagLoc endLoc(*diagSM, SM, SrcRange.getEnd(), /*wantEnd=*/true);
+  LineColRange.EndLine = endLoc.line;
+  LineColRange.EndCol = endLoc.column;
+
+  return LineColRange;
+}
+
+namespace {
+
+static constexpr StringLiteral fixitExpectationNoneString("none");
+static constexpr StringLiteral categoryDocFileSpecifier("documentation-file=");
+static constexpr StringLiteral groupNameSpecifier("group-name=");
+
+struct ExpectedDiagnosticInfo {
+  // This specifies the full range of the "expected-foo {{}}" specifier.
+  const char *ExpectedStart, *ExpectedEnd = nullptr;
+
+  // This specifies the full range of the classification string.
+  const char *ClassificationStart, *ClassificationEnd = nullptr;
+
+  DiagnosticKind Classification;
+
+  // This is true if a '*' constraint is present to say that the diagnostic
+  // may appear (or not) an uncounted number of times.
+  bool mayAppear = false;
+
+  // This is true if a '{{none}}' is present to mark that there should be no
+  // extra fixits.
+  bool noExtraFixitsMayAppear() const { return noneMarkerStartLoc != nullptr; };
+
+  // This is the raw input buffer for the message text, the part in the
+  // {{...}}
+  StringRef MessageRange;
+
+  // This is the message string with escapes expanded.
+  std::string MessageStr;
+  unsigned LineNo = ~0U;
+  std::optional<unsigned> ColumnNo;
+
+  // nullopt: verifyDiagnostics() will use current buffer ID.
+  // FIXME: This is very weird and feels wrong for some cases.
+  std::optional<unsigned> TargetBufferID;
+
+  using AlternativeExpectedFixIts = std::vector<ExpectedFixIt>;
+  std::vector<AlternativeExpectedFixIts> Fixits = {};
+
+  // Loc of {{none}}
+  const char *noneMarkerStartLoc = nullptr;
+
+  /// Represents a specifier of the form '{{documentation-file=note1}}'.
+  struct ExpectedDocumentationFile {
+    const char *StartLoc, *EndLoc; // The loc of the {{ and }}'s.
+    StringRef Name; // Name of expected documentation file.
+
+    ExpectedDocumentationFile(const char *StartLoc, const char *EndLoc,
+                              StringRef Name)
+        : StartLoc(StartLoc), EndLoc(EndLoc), Name(Name) {}
+  };
+  std::optional<ExpectedDocumentationFile> DocumentationFile;
+
+  /// Represents a specifier of the form '{{group-name=GroupName}}'. Multiple
+  /// of these are allowed per expected diagnostic; the diagnostic must belong
+  /// to each named group.
+  struct ExpectedGroupName {
+    const char *StartLoc, *EndLoc; // The loc of the {{ and }}'s.
+    StringRef Name; // Name of expected diagnostic group.
+
+    ExpectedGroupName(const char *StartLoc, const char *EndLoc, StringRef Name)
+        : StartLoc(StartLoc), EndLoc(EndLoc), Name(Name) {}
+  };
+  std::vector<ExpectedGroupName> GroupNames;
+
+  std::vector<ExpectedDiagnosticInfo> NestedDiags = {};
+
+  std::vector<ExpectedDiagnosticInfo> ExpectedChildNotes = {};
+  // Locs of {{children: and }}
+  const char *ChildrenMarkerStartLoc = nullptr;
+  const char *ChildrenMarkerEndLoc = nullptr;
+  // This diagnostic has been matched, but contains unmatched child notes
+  bool HasBeenFound = false;
+
+  // If a '@#marker' reference names a '// #name@N' marker whose enclosing
+  // expected-expansion block has not been parsed yet, its resolution is
+  // deferred until every block's markers have been bound.
+  StringRef DeferredMarkerName;
+
+  ExpectedDiagnosticInfo(const char *ExpectedStart,
+                         const char *ClassificationStart,
+                         const char *ClassificationEnd,
+                         DiagnosticKind Classification)
+      : ExpectedStart(ExpectedStart), ClassificationStart(ClassificationStart),
+        ClassificationEnd(ClassificationEnd), Classification(Classification) {}
+};
+
+static std::string getDiagKindString(DiagnosticKind Kind) {
+  switch (Kind) {
+  case DiagnosticKind::Error:
+    return "error";
+  case DiagnosticKind::Warning:
+    return "warning";
+  case DiagnosticKind::Note:
+    return "note";
+  case DiagnosticKind::Remark:
+    return "remark";
+  case DiagnosticKindExpansion:
+    return "expansion";
+  }
+
+  llvm_unreachable("Unhandled DiagKind in switch.");
+}
+
+[[deprecated("only for use in the debugger")]] LLVM_ATTRIBUTE_USED
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
+                                     const CapturedDiagnosticInfo &D) {
+      OS << "[id=" << D.ID;
+  if (D.ParentID)
+    OS << " parent=" << *D.ParentID;
+  OS << " " << getDiagKindString(D.Classification);
+  OS << " " << D.Line << ":" << D.Column;
+  OS << " \"" << D.Message << "\"";
+  if (!D.FixIts.empty())
+    OS << " fixit-count=" << D.FixIts.size();
+  if (!D.CategoryDocFile.empty())
+    OS << " doc=" << D.CategoryDocFile;
+  OS << "]";
+  return OS;
+}
+
+/// Render the verifier syntax for a given documentation file.
+static std::string
+renderDocumentationFile(const std::string &documentationFile) {
+  std::string Result;
+  llvm::raw_string_ostream OS(Result);
+  OS << "{{" << categoryDocFileSpecifier << documentationFile << "}}";
+  return OS.str();
+}
+
+/// Render the verifier syntax for a given diagnostic group name.
+static std::string renderGroupName(StringRef groupName) {
+  std::string Result;
+  llvm::raw_string_ostream OS(Result);
+  OS << "{{" << groupNameSpecifier << groupName << "}}";
+  return OS.str();
+}
+
+/// If we find the specified diagnostic in the list, return it with \c true .
+/// If we find a near-match that varies only in classification, return it with
+/// \c false.
+/// Otherwise return \c CapturedDiagnostics.end() with \c false.
+static std::tuple<std::vector<CapturedDiagnosticInfo>::iterator, bool>
+findDiagnostic(std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics,
+               const ExpectedDiagnosticInfo &Expected, unsigned BufferID,
+               SourceManager &SM, std::optional<size_t> ParentID) {
+  auto fallbackI = CapturedDiagnostics.end();
+
+  for (auto I = CapturedDiagnostics.begin(), E = CapturedDiagnostics.end();
+       I != E; ++I) {
+    // Verify the file and line of the diagnostic.
+    if (I->Line != Expected.LineNo || I->SourceBufferID != BufferID)
+      continue;
+
+    // If a specific column was expected, verify it.
+    if (Expected.ColumnNo.has_value() && I->Column != *Expected.ColumnNo)
+      continue;
+
+    // Verify the classification and string.
+    if (I->Message.find(Expected.MessageStr) == StringRef::npos)
+      continue;
+
+    // Verify the parent.
+    if (I->ParentID != ParentID) {
+      continue;
+    }
+
+    // Verify the classification and, if incorrect, remember as a second choice.
+    if (I->Classification != Expected.Classification) {
+      if (fallbackI == E && !Expected.MessageStr.empty())
+        fallbackI = I;
+      continue;
+    }
+
+    // Okay, we found a match, hurray!
+    return { I, true };
+  }
+
+  // No perfect match; we'll return the fallback or `end()` instead.
+  return { fallbackI, false };
+}
+
+/// If there are any -verify errors (e.g. differences between expectations
+/// and actual diagnostics produced), apply fixits to the original source
+/// file and drop it back in place.
+static void autoApplyFixes(SourceManager &SM, unsigned BufferID,
+                           ArrayRef<SMDiagnosticWithNotes> diags) {
+  // Can't apply fixits to a file that doesn't exist.
+  if (!BufferID)
+    return;
+
+  // Walk the list of diagnostics, pulling out any fixits into an array of just
+  // them.
+  SmallVector<llvm::SMFixIt, 4> FixIts;
+  for (auto &diag : diags)
+    FixIts.append(diag.Diag.getFixIts().begin(), diag.Diag.getFixIts().end());
+
+  // If we have no fixits to apply, avoid touching the file.
+  if (FixIts.empty())
+    return;
+
+  // Sort the fixits by their start location.
+  std::sort(FixIts.begin(), FixIts.end(),
+            [&](const llvm::SMFixIt &lhs, const llvm::SMFixIt &rhs) -> bool {
+              return lhs.getRange().Start.getPointer() <
+                     rhs.getRange().Start.getPointer();
+            });
+  // Coalesce identical fix-its. This happens most often with "expected-error 2"
+  // syntax.
+  FixIts.erase(std::unique(FixIts.begin(), FixIts.end(),
+                           [](const llvm::SMFixIt &lhs,
+                              const llvm::SMFixIt &rhs) -> bool {
+                             return lhs.getRange().Start ==
+                                        rhs.getRange().Start &&
+                                    lhs.getRange().End == rhs.getRange().End &&
+                                    lhs.getText() == rhs.getText();
+                           }),
+               FixIts.end());
+  // Filter out overlapping fix-its. This allows the compiler to apply changes
+  // to the easy parts of the file, and leave in the tricky cases for the
+  // developer to handle manually.
+  FixIts.erase(swift::removeAdjacentIf(
+                   FixIts.begin(), FixIts.end(),
+                   [](const llvm::SMFixIt &lhs, const llvm::SMFixIt &rhs) {
+                     return lhs.getRange().End.getPointer() >
+                            rhs.getRange().Start.getPointer();
+                   }),
+               FixIts.end());
+
+  // Get the contents of the original source file.
+  auto memBuffer = SM.getLLVMSourceMgr().getMemoryBuffer(BufferID);
+  auto bufferRange = memBuffer->getBuffer();
+
+  // Apply the fixes, building up a new buffer as an std::string.
+  const char *LastPos = bufferRange.begin();
+  std::string Result;
+
+  for (auto &fix : FixIts) {
+    // We cannot handle overlapping fixits, so assert that they don't happen.
+    assert(LastPos <= fix.getRange().Start.getPointer() &&
+           "Cannot handle overlapping fixits");
+
+    // Keep anything from the last spot we've checked to the start of the fixit.
+    Result.append(LastPos, fix.getRange().Start.getPointer());
+
+    // Replace the content covered by the fixit with the replacement text.
+    Result.append(fix.getText().begin(), fix.getText().end());
+
+    // Next character to consider is at the end of the fixit.
+    LastPos = fix.getRange().End.getPointer();
+  }
+
+  // Retain the end of the file.
+  Result.append(LastPos, bufferRange.end());
+
+  std::error_code error;
+  llvm::raw_fd_ostream outs(memBuffer->getBufferIdentifier(), error,
+                            llvm::sys::fs::OpenFlags::OF_None);
+  if (!error)
+    outs << Result;
+}
+} // end anonymous namespace
+
+bool DiagnosticVerifier::verifyUnrelated(
+    std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics) const {
+  bool HadError = false;
+  auto CapturedDiagIter = CapturedDiagnostics.begin();
+  while (CapturedDiagIter != CapturedDiagnostics.end()) {
+    HadError = true;
+    std::string Message =
+        ("unexpected " +
+         getDiagKindString(CapturedDiagIter->Classification) +
+         " produced: " + CapturedDiagIter->Message)
+            .str();
+
+    SourceLoc Loc = CapturedDiagIter->Loc;
+    auto diag = SM.GetMessage(Loc, llvm::SourceMgr::DK_Error, Message, {}, {});
+    printDiagnostic(diag);
+
+    unsigned TopmostBufferID = SM.findBufferContainingLoc(Loc);
+    while (const GeneratedSourceInfo *GSI =
+               SM.getGeneratedSourceInfo(TopmostBufferID)) {
+      SourceLoc ParentLoc = GSI->originalSourceRange.getStart();
+      if (ParentLoc.isInvalid())
+        break;
+      TopmostBufferID = SM.findBufferContainingLoc(ParentLoc);
+      Loc = ParentLoc;
+    }
+    auto FileName = SM.getIdentifierForBuffer(TopmostBufferID);
+    auto noteDiag =
+        SM.GetMessage(Loc, llvm::SourceMgr::DK_Note,
+                      ("file '" + FileName +
+                       "' is not parsed for 'expected' statements. Use "
+                       "'-verify-additional-file " +
+                       FileName +
+                       "' to enable, or '-verify-ignore-unrelated' to "
+                       "ignore diagnostics in this file"),
+                      {}, {});
+    printDiagnostic(noteDiag);
+    CapturedDiagIter = CapturedDiagnostics.erase(CapturedDiagIter);
+  }
+
+  return HadError;
+}
+
+/// Return true if the given \p ExpectedFixIt is in the fix-its emitted by
+/// diagnostic \p D.
+bool DiagnosticVerifier::checkForFixIt(
+    const ExpectedDiagnosticInfo::AlternativeExpectedFixIts &ExpectedAlts,
+    const CapturedDiagnosticInfo &D) const {
+  for (auto &ActualFixIt : D.FixIts) {
+    for (auto &Expected : ExpectedAlts) {
+      if (ActualFixIt.getText() != Expected.Text)
+        continue;
+
+      auto &ActualRange = ActualFixIt.getLineColumnRange(SM);
+
+      if (Expected.Range.StartCol != ActualRange.StartCol ||
+          Expected.Range.EndCol != ActualRange.EndCol ||
+          Expected.Range.StartLine != ActualRange.StartLine ||
+          Expected.Range.EndLine != ActualRange.EndLine) {
+        continue;
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void DiagnosticVerifier::printDiagnostic(const SMDiagnosticWithNotes &Diag) const {
+  printDiagnostic(Diag.Diag);
+  for (const auto &Note : Diag.Notes)
+    printDiagnostic(Note);
+}
+
+void DiagnosticVerifier::printDiagnostic(const llvm::SMDiagnostic &Diag) const {
+  raw_ostream &stream = llvm::errs();
+  ColoredStream coloredStream{stream};
+  raw_ostream &out = UseColor ? coloredStream : stream;
+  llvm::SourceMgr &Underlying = SM.getLLVMSourceMgr();
+  if (Diag.getFilename().empty()) {
+    llvm::SMDiagnostic SubstDiag(
+        *Diag.getSourceMgr(), Diag.getLoc(), "<empty-filename>",
+        Diag.getLineNo(), Diag.getColumnNo(), Diag.getKind(), Diag.getMessage(),
+        Diag.getLineContents(), Diag.getRanges(), Diag.getFixIts());
+    Underlying.PrintMessage(out, SubstDiag);
+  } else
+    Underlying.PrintMessage(out, Diag);
+
+  SourceLoc Loc = SourceLoc::getFromPointer(Diag.getLoc().getPointer());
+  if (Loc.isInvalid())
+    return;
+  unsigned BufferID = SM.findBufferContainingLoc(Loc);
+  if (const GeneratedSourceInfo *GSI = SM.getGeneratedSourceInfo(BufferID)) {
+    SourceLoc ParentLoc = GSI->originalSourceRange.getStart();
+    if (ParentLoc.isInvalid())
+      return;
+    const ExpansionContext &ctx = Expansions.find(ParentLoc)->getSecond();
+    auto idx = llvm::to_string(ctx.expansionIndex(BufferID));
+    printDiagnostic(SM.GetMessage(ParentLoc, llvm::SourceMgr::DK_Note,
+                                  "in expansion " + idx + " from here", {}, {}));
+  }
+}
+
+std::string
+DiagnosticVerifier::renderFixits(ArrayRef<CapturedFixItInfo> ActualFixIts,
+                                 unsigned DiagnosticLineNo) const {
+  std::string Result;
+  llvm::raw_string_ostream OS(Result);
+  interleave(
+      ActualFixIts,
+      [&](const CapturedFixItInfo &ActualFixIt) {
+        auto &ActualRange = ActualFixIt.getLineColumnRange(SM);
+        OS << "{{";
+
+        if (ActualRange.StartLine != DiagnosticLineNo)
+          OS << ActualRange.StartLine << ':';
+        OS << ActualRange.StartCol;
+
+        OS << '-';
+
+        if (ActualRange.EndLine != ActualRange.StartLine)
+          OS << ActualRange.EndLine << ':';
+        OS << ActualRange.EndCol;
+
+        OS << '=';
+
+        for (auto C : ActualFixIt.getText()) {
+          if (C == '\n')
+            OS << "\\n";
+          else if (C == '}' || C == '\\')
+            OS << '\\' << C;
+          else
+            OS << C;
+        }
+        OS << "}}";
+      },
+      [&] { OS << ' '; });
+  return OS.str();
+}
+
+/// Parse the introductory line-column range of an expected fix-it by consuming
+/// the given input string. The range format is \c ([+-]?N:)?N-([+-]?N:)?N
+/// where \c 'N' is \c [0-9]+.
+///
+/// \param DiagnosticLineNo The line number of the associated expected
+/// diagnostic; used to turn line offsets into line numbers.
+std::optional<LineColumnRange>
+DiagnosticVerifier::parseExpectedFixItRange(StringRef &Str,
+                                            unsigned DiagnosticLineNo) {
+  assert(!Str.empty());
+
+  struct ParsedLineAndColumn {
+    std::optional<unsigned> Line;
+    unsigned Column;
+  };
+
+  const auto parseLineAndColumn = [&]() -> std::optional<ParsedLineAndColumn> {
+    enum class OffsetKind : uint8_t { None, Plus, Minus };
+
+    OffsetKind LineOffsetKind = OffsetKind::None;
+    if (!Str.empty()) {
+      switch (Str.front()) {
+      case '+':
+        LineOffsetKind = OffsetKind::Plus;
+        Str = Str.drop_front();
+        break;
+      case '-':
+        LineOffsetKind = OffsetKind::Minus;
+        Str = Str.drop_front();
+        break;
+      default:
+        break;
+      }
+    }
+
+    unsigned FirstVal = 0;
+    if (Str.consumeInteger(10, FirstVal)) {
+      if (LineOffsetKind == OffsetKind::None) {
+        addError(Str.data(),
+                      "expected line or column number in fix-it verification");
+      } else {
+        addError(Str.data(),
+                      "expected line offset after leading '+' or '-' in fix-it "
+                      "verification");
+      }
+      return std::nullopt;
+    }
+
+    // If the first value is not followed by a colon, it is either a column or a
+    // line offset that is missing a column.
+    if (Str.empty() || Str.front() != ':') {
+      if (LineOffsetKind == OffsetKind::None) {
+        return ParsedLineAndColumn{std::nullopt, FirstVal};
+      }
+
+      addError(Str.data(),
+                    "expected colon-separated column number after line offset "
+                    "in fix-it verification");
+      return std::nullopt;
+    }
+
+    unsigned Column = 0;
+    Str = Str.drop_front();
+    if (Str.consumeInteger(10, Column)) {
+      addError(Str.data(),
+                    "expected column number after ':' in fix-it verification");
+      return std::nullopt;
+    }
+
+    // Apply the offset relative to the line of the expected diagnostic.
+    switch (LineOffsetKind) {
+    case OffsetKind::None:
+      break;
+    case OffsetKind::Plus:
+      FirstVal += DiagnosticLineNo;
+      break;
+    case OffsetKind::Minus:
+      FirstVal = DiagnosticLineNo - FirstVal;
+      break;
+    }
+
+    return ParsedLineAndColumn{FirstVal, Column};
+  };
+
+  LineColumnRange Range;
+
+  if (const auto LineAndCol = parseLineAndColumn()) {
+    // The start line defaults to the line of the expected diagnostic.
+    Range.StartLine = LineAndCol->Line.value_or(DiagnosticLineNo);
+    Range.StartCol = LineAndCol->Column;
+  } else {
+    return std::nullopt;
+  }
+
+  if (!Str.empty() && Str.front() == '-') {
+    Str = Str.drop_front();
+  } else {
+    addError(Str.data(),
+                  "expected '-' range separator in fix-it verification");
+    return std::nullopt;
+  }
+
+  if (const auto LineAndCol = parseLineAndColumn()) {
+    // The end line defaults to the start line.
+    Range.EndLine = LineAndCol->Line.value_or(Range.StartLine);
+    Range.EndCol = LineAndCol->Column;
+  } else {
+    return std::nullopt;
+  }
+
+  return Range;
+}
+
+/// Before we do anything, check if any of our prefixes are prefixes of later
+/// prefixes. In such a case, we will never actually pattern match the later
+/// prefix. In such a case, crash with a nice error message.
+static void validatePrefixList(ArrayRef<std::string> prefixes) {
+  // Work backwards through the prefix list.
+  while (!prefixes.empty()) {
+    auto target = StringRef(prefixes.front());
+    prefixes = prefixes.drop_front();
+
+    for (auto &p : prefixes) {
+      if (StringRef(p).starts_with(target)) {
+        llvm::errs() << "Error! Found a verifier diagnostic additional prefix "
+                        "that is a prefix of a later prefix. The later prefix "
+                        "will never be pattern matched!\n"
+                     << "First Prefix: " << target << '\n'
+                     << "Second Prefix: " << p << '\n';
+        llvm::report_fatal_error("Standard compiler error!\n");
+      }
+    }
+  }
+}
+
+bool DiagnosticVerifier::parseTargetBufferName(StringRef &MatchStart,
+                                               StringRef &Out,
+                                               size_t &TextStartIdx) {
+  StringRef Offs = MatchStart.slice(0, TextStartIdx);
+
+  if (Offs.starts_with("@'")) {
+    // Windows paths may start with something like T:\, so they need to be quoted
+    // to prevent the colon from seeming like the end of the path.
+    Offs = Offs.substr(2);
+    size_t QuoteEndIndex = Offs.find("'");
+    if (QuoteEndIndex == StringRef::npos) {
+      addError(
+          MatchStart.data(),
+          "no closing \"'\" found to match opening \"'\" for file path here");
+      return false;
+    }
+    if (!Offs.substr(QuoteEndIndex + 1).starts_with(":")) {
+      addError(MatchStart.data(), "expected ':' after buffer name");
+      return false;
+    }
+    Out = Offs.slice(0, QuoteEndIndex);
+    MatchStart = MatchStart.substr(QuoteEndIndex + 3);
+    TextStartIdx -= (QuoteEndIndex + 3);
+    return true;
+  }
+
+  size_t LineIndex = Offs.find(':');
+  if (LineIndex == 0 || LineIndex == StringRef::npos)
+    return false;
+  Out = Offs.slice(1, LineIndex);
+  MatchStart = MatchStart.substr(LineIndex);
+  TextStartIdx -= LineIndex;
+  return true;
+}
+
+static void forEachMarkerDefinition(
+    StringRef Text,
+    llvm::function_ref<void(const char *HashLoc, StringRef Name,
+                            std::optional<unsigned> ExpansionLine)>
+        Callback);
+
+void DiagnosticVerifier::parseNestedExpectedDiagInfoBlock(
+    unsigned BufferID, StringRef MatchStartIn,
+    unsigned &PrevExpectedContinuationLine,
+    std::vector<ExpectedDiagnosticInfo> &NestedDiagsOut, size_t &End,
+    bool InExpansion) {
+  // Find the '}}' that closes this block by balancing brace pairs. Callers
+  // enter this function already inside one block. Normalize by skipping a
+  // leading '{{' if present and starting at depth 1, then scanning for the '}}'
+  // that returns to depth 0.
+  size_t BlockClose = StringRef::npos;
+  {
+    size_t Depth = 1;
+    for (size_t P = MatchStartIn.starts_with("{{") ? 2 : 0,
+                E = MatchStartIn.size();
+         P + 1 < E;) {
+      if (MatchStartIn[P] == '{' && MatchStartIn[P + 1] == '{') {
+        ++Depth;
+        P += 2;
+      } else if (MatchStartIn[P] == '}' && MatchStartIn[P + 1] == '}') {
+        if (--Depth == 0) {
+          BlockClose = P;
+          break;
+        }
+        P += 2;
+      } else {
+        ++P;
+      }
+    }
+  }
+
+  size_t NestedMatch = MatchStartIn.find("expected-");
+  // A block with no nested 'expected-' directive before its own closing '}}'.
+  if (NestedMatch == StringRef::npos ||
+      (BlockClose != StringRef::npos && NestedMatch > BlockClose)) {
+    End = BlockClose;
+    return;
+  }
+  // Scan the memory buffer looking for expected-note/warning/error.
+  while (NestedMatch != StringRef::npos) {
+    StringRef NestedMatchStartIn = MatchStartIn.substr(NestedMatch);
+    ExpectedDiagnosticInfo NestedExpected(nullptr, nullptr, nullptr,
+                                          DiagnosticKind(-1));
+    unsigned NestedCount =
+        parseExpectedDiagInfo(BufferID, NestedMatchStartIn,
+                              PrevExpectedContinuationLine, NestedExpected,
+                              InExpansion);
+
+    size_t PrevMatchEnd = NestedMatch + 1;
+    if (NestedCount > 0) {
+      // Add the diagnostic the expected number of times.
+      for (; NestedCount; --NestedCount)
+        NestedDiagsOut.push_back(NestedExpected);
+      size_t NestedMatchEnd =
+          NestedExpected.ExpectedEnd - NestedMatchStartIn.data();
+      assert(NestedMatchEnd > 0);
+      PrevMatchEnd = NestedMatch + NestedMatchEnd;
+    } else {
+      // Skip line if this an expected diagnostic with a prefix this invocation
+      // ignores, otherwise its }} will close the expansion.
+      PrevMatchEnd = MatchStartIn.find("\n", PrevMatchEnd);
+    }
+
+    size_t NextEnd = MatchStartIn.find("}}", PrevMatchEnd);
+    NestedMatch = MatchStartIn.find("expected-", PrevMatchEnd);
+    if (NextEnd < NestedMatch) {
+      End = NextEnd;
+      break;
+    }
+  }
+}
+
+unsigned DiagnosticVerifier::parseExpectedDiagInfo(
+    unsigned BufferID, StringRef MatchStartIn,
+    unsigned &PrevExpectedContinuationLine,
+    ExpectedDiagnosticInfo &Expected, bool InExpansion) {
+  const SourceLoc BufferStartLoc = SM.getLocForBufferStart(BufferID);
+  StringRef InputFile = SM.getEntireTextForBuffer(BufferID);
+
+  StringRef MatchStart = MatchStartIn;
+  const char *DiagnosticLoc = MatchStart.data();
+  MatchStart = MatchStart.substr(strlen("expected-"));
+
+  const char *ClassificationStartLoc = nullptr;
+  std::optional<DiagnosticKind> ExpectedClassification;
+  {
+    ExpectedCheckMatchStartParser parser(MatchStart);
+    // If we fail to parse... continue.
+    if (!parser.parse(AdditionalExpectedPrefixes)) {
+      return 0;
+    }
+    MatchStart = parser.MatchStart;
+    ClassificationStartLoc = parser.ClassificationStartLoc;
+    ExpectedClassification = parser.ExpectedClassification;
+  }
+  assert(ClassificationStartLoc);
+  assert(bool(ExpectedClassification));
+
+  // Skip any whitespace before the {{.
+  MatchStart = MatchStart.substr(MatchStart.find_first_not_of(" \t"));
+
+  size_t TextStartIdx = MatchStart.find("{{");
+  if (TextStartIdx >=
+      MatchStart.find("\n")) { // Either not found, or found beyond next \n
+    addError(MatchStart.data(),
+             "expected {{ in expected-warning/note/error/expansion line");
+    return 0;
+  }
+
+  Expected = ExpectedDiagnosticInfo(DiagnosticLoc, ClassificationStartLoc,
+                                  /*ClassificationEndLoc=*/MatchStart.data(),
+                                  *ExpectedClassification);
+  int LineOffset = 0;
+  bool AbsoluteLine = false;
+  bool RelativeLine = false;
+  bool NoLineOffsetNeeded = false;
+
+  if (TextStartIdx > 0 && MatchStart[0] == '@') {
+    if (MatchStart[1] != '#' && MatchStart[1] != '+' && MatchStart[1] != '-' && MatchStart[1] != ':' && MatchStart[1] != '<' && (MatchStart[1] < '0' || MatchStart[1] > '9')) {
+      StringRef TargetBufferName;
+      if (!parseTargetBufferName(MatchStart, TargetBufferName, TextStartIdx)) {
+        addError(MatchStart.data(), "expected '+'/'-' for line offset, ':' "
+                                    "for column, or a buffer name");
+        return 0;
+      }
+      Expected.TargetBufferID = SM.getIDForBufferIdentifier(TargetBufferName);
+      if (!Expected.TargetBufferID) {
+        addError(MatchStart.data(),
+                 "no buffer with name '" + TargetBufferName + "' found");
+        return 0;
+      }
+      if (MatchStart[0] != ':' || MatchStart[1] < '0' || MatchStart[1] > '9') {
+        addError(MatchStart.data(),
+                 "expected absolute line number for diagnostic in other buffer");
+        return 0;
+      }
+    }
+
+    // Location marker reference: @#markerName or @#markerName:col
+    StringRef Offs;
+    if (MatchStart[0] == '@' && MatchStart[1] == '#') {
+      size_t NameStart = 2;
+      size_t NameEnd = NameStart;
+      while (NameEnd < TextStartIdx &&
+             (isalnum(MatchStart[NameEnd]) ||
+              MatchStart[NameEnd] == '_' || MatchStart[NameEnd] == '-'))
+        ++NameEnd;
+
+      if (NameEnd == NameStart) {
+        addError(MatchStart.data() + 1,
+                 "expected marker name after '#'");
+        return 0;
+      }
+
+      StringRef MarkerName = MatchStart.slice(NameStart, NameEnd);
+      NoLineOffsetNeeded = true;
+      auto It = LocationMarkers.find(MarkerName);
+      if (It == LocationMarkers.end()) {
+        // The marker is not defined anywhere in the file -- neither a plain
+        // '// #name' nor an expansion-relative '// #name@N' (both of which are
+        // registered by scanForMarkers() before any directive is parsed). It
+        // will never resolve, so diagnose it now rather than deferring.
+        addError(MatchStart.data() + 1,
+                 "use of undefined location marker '#" + MarkerName + "'");
+        return 0;
+      }
+      if (It->second.BufferID.has_value()) {
+        LineOffset = It->second.Line;
+        AbsoluteLine = true;
+        // A `@#marker` names an exact location, so pin its buffer. This matters
+        // for a diagnostic inside an expansion whose child note points back
+        // into the outer file: the marker's buffer differs from the expansion
+        // buffer the parent is verified against. When the marker is in the
+        // buffer being parsed this is a no-op at verification time.
+        Expected.TargetBufferID = It->second.BufferID;
+      } else {
+        // A known expansion-relative marker ('// #name@N') whose enclosing
+        // expected-expansion block has not been parsed yet -- it appears later
+        // in the file than this reference, so its buffer location is still
+        // unresolved. Defer resolution until every directive has been parsed;
+        // resolveDeferredMarkers() binds it afterwards.
+        Expected.DeferredMarkerName = MarkerName;
+        AbsoluteLine = true;
+      }
+
+      // Extract the remainder after the marker name (e.g. ":col" or empty)
+      // and let the shared column-parsing code below handle it.
+      Offs = MatchStart.slice(NameEnd, TextStartIdx).rtrim();
+    } else if (MatchStart[1] == '+') {
+      RelativeLine = true;
+      Offs = MatchStart.slice(2, TextStartIdx).rtrim();
+    } else if (MatchStart.starts_with("@<unknown>")) {
+      AbsoluteLine = true;
+      NoLineOffsetNeeded = true;
+      Expected.TargetBufferID = InvalidBufferID;
+      Offs = MatchStart.slice(strlen("@<unknown>"), TextStartIdx).rtrim();
+    } else {
+      Offs = MatchStart.slice(1, TextStartIdx).rtrim();
+      if (Offs[0] >= '0' && Offs[0] <= '9')
+        AbsoluteLine = true;
+      else if (Offs[0] == '-')
+        RelativeLine = true;
+    }
+    ASSERT(!RelativeLine || !AbsoluteLine);
+
+    size_t SpaceIndex = Offs.find(' ');
+    if (SpaceIndex != StringRef::npos && SpaceIndex < TextStartIdx) {
+      size_t Delta = Offs.size() - SpaceIndex;
+      MatchStart = MatchStart.substr(TextStartIdx - Delta);
+      TextStartIdx = Delta;
+      Offs = Offs.slice(0, SpaceIndex);
+    } else {
+      MatchStart = MatchStart.substr(TextStartIdx);
+      TextStartIdx = 0;
+    }
+
+    size_t ColonIndex = Offs.find(':');
+    // Check whether a line offset was provided (not applicable for markers).
+    if (!NoLineOffsetNeeded && ColonIndex != 0) {
+      StringRef LineOffs = Offs.slice(0, ColonIndex);
+      if (LineOffs.getAsInteger(10, LineOffset)) {
+        addError(MatchStart.data(), "expected line offset before '{{'");
+        return 0;
+      }
+    }
+
+    // Check whether a column was provided
+    if (ColonIndex != StringRef::npos) {
+      Offs = Offs.slice(ColonIndex + 1, Offs.size());
+      int Column = 0;
+      if (Offs.getAsInteger(10, Column)) {
+        addError(MatchStart.data(), "expected column before '{{'");
+        return 0;
+      }
+      Expected.ColumnNo = Column;
+    }
+  }
+
+  if (InExpansion && RelativeLine) {
+    addError(DiagnosticLoc,
+             "relative line offsets are not allowed inside expected-expansion; "
+             "use an absolute line number or a '@#marker' reference");
+    return 0;
+  }
+
+  if (Expected.Classification == DiagnosticKindExpansion && !Expected.ColumnNo.has_value()) {
+    addError(DiagnosticLoc, "expected-expansion requires column location");
+    return 0;
+  }
+
+  unsigned Count = 1;
+  if (TextStartIdx > 0) {
+    StringRef CountStr = MatchStart.substr(0, TextStartIdx).trim(" \t");
+    if (CountStr == "*") {
+      Expected.mayAppear = true;
+    } else {
+      if (CountStr.getAsInteger(10, Count)) {
+        addError(MatchStart.data(), "expected match count before '{{'");
+        return 0;
+      }
+      if (Count == 0) {
+        addError(MatchStart.data(),
+                 "expected positive match count before '{{'");
+        return 0;
+      }
+    }
+
+    // Resync up to the '{{'.
+    MatchStart = MatchStart.substr(TextStartIdx);
+  }
+
+  if (AbsoluteLine)
+    Expected.LineNo = 0;
+  else if (PrevExpectedContinuationLine)
+    Expected.LineNo = PrevExpectedContinuationLine;
+  else
+    Expected.LineNo =
+        SM.getLineAndColumnInBuffer(BufferStartLoc.getAdvancedLoc(
+                                        MatchStart.data() - InputFile.data()),
+                                    BufferID)
+            .first;
+  Expected.LineNo += LineOffset;
+
+  size_t End = StringRef::npos;
+  if (Expected.Classification == DiagnosticKindExpansion) {
+    parseNestedExpectedDiagInfoBlock(BufferID, MatchStart,
+                                     PrevExpectedContinuationLine,
+                                     Expected.NestedDiags, End,
+                                     /*InExpansion=*/true);
+
+    if (End == StringRef::npos) {
+      addError(DiagnosticLoc,
+               "didn't find '}}' to match '{{' in expected-expansion");
+      return 0;
+    }
+
+    SourceLoc ExpansionLoc =
+        SM.getLocForLineCol(BufferID, Expected.LineNo, *Expected.ColumnNo);
+    // Bind this block's '#name@N' markers to the specific sibling expansion
+    // this directive targets. Directives at a shared location are parsed in
+    // source order, which is the same order the verifier numbers expansion
+    // indices, so nextParseBuffer() hands back the matching buffer (0 if this
+    // directive has no corresponding produced expansion).
+    auto ExpansionIt = Expansions.find(ExpansionLoc);
+    std::optional<unsigned> ExpansionBufferID = std::nullopt;
+    if (ExpansionIt != Expansions.end())
+      ExpansionBufferID = ExpansionIt->second.nextParseBuffer();
+    processExpansionMarkerDefinitions(MatchStart.slice(2, End),
+                                      ExpansionBufferID);
+  } else {
+    End = MatchStart.find("}}");
+    if (End == StringRef::npos) {
+      addError(
+          MatchStart.data(),
+          "didn't find '}}' to match '{{' in expected-warning/note/error line");
+      return 0;
+    }
+  }
+
+  llvm::SmallString<256> Buf;
+  Expected.MessageRange = MatchStart.slice(2, End);
+  Expected.MessageStr =
+      Lexer::getEncodedStringSegment(Expected.MessageRange, Buf).str();
+
+  // Check if the next expected diagnostic should be in the same line.
+  StringRef AfterEnd = MatchStart.substr(End + strlen("}}"));
+  AfterEnd = AfterEnd.substr(AfterEnd.find_first_not_of(" \t"));
+  if (AfterEnd.starts_with("\\"))
+    PrevExpectedContinuationLine = Expected.LineNo;
+  else
+    PrevExpectedContinuationLine = 0;
+
+  // Scan for fix-its: {{10-14=replacement text}}
+  bool startNewAlternatives = true;
+  StringRef ExtraChecks = MatchStart.substr(End + 2).ltrim(" \t");
+  while (ExtraChecks.starts_with("{{") &&
+         !ExtraChecks.starts_with("{{children:")) {
+    // First make sure we have a closing "}}".
+    size_t EndIndex = ExtraChecks.find("}}");
+    if (EndIndex == StringRef::npos) {
+      addError(ExtraChecks.data(),
+               "didn't find '}}' to match '{{' in diagnostic verification");
+      break;
+    }
+
+    // Allow for close braces to appear in the replacement text.
+    while (EndIndex + 2 < ExtraChecks.size() &&
+           ExtraChecks[EndIndex + 2] == '}')
+      ++EndIndex;
+
+    const char *OpenLoc = ExtraChecks.data(); // Beginning of opening '{{'.
+    const char *CloseLoc =
+        ExtraChecks.data() + EndIndex + 2; // End of closing '}}'.
+
+    StringRef CheckStr = ExtraChecks.slice(2, EndIndex);
+    // Check for matching a later "}}" on a different line.
+    if (CheckStr.find_first_of("\r\n") != StringRef::npos) {
+      addError(ExtraChecks.data(), "didn't find '}}' to match '{{' in "
+                                   "diagnostic verification");
+      break;
+    }
+
+    // Prepare for the next round of checks.
+    ExtraChecks = ExtraChecks.substr(EndIndex + 2).ltrim(" \t");
+
+    // Handle fix-it alternation.
+    // If two fix-its are separated by `||`, we can match either of the two.
+    // This is represented by putting them in the same subarray of `Fixits`.
+    // If they are not separated by `||`, we must match both of them.
+    // This is represented by putting them in separate subarrays of `Fixits`.
+    if (startNewAlternatives &&
+        (Expected.Fixits.empty() || !Expected.Fixits.back().empty()))
+      Expected.Fixits.push_back({});
+
+    if (ExtraChecks.starts_with("||")) {
+      startNewAlternatives = false;
+      ExtraChecks = ExtraChecks.substr(2).ltrim(" \t");
+    } else {
+      startNewAlternatives = true;
+    }
+
+    // If this check starts with 'documentation-file=', check for a
+    // documentation file name instead of a fix-it.
+    if (CheckStr.starts_with(categoryDocFileSpecifier)) {
+      if (Expected.DocumentationFile.has_value()) {
+        addError(CheckStr.data(),
+                 "each verified diagnostic may only have one "
+                 "{{documentation-file=<#notes#>}} declaration");
+        continue;
+      }
+
+      // Trim 'documentation-file='.
+      StringRef name = CheckStr.substr(categoryDocFileSpecifier.size());
+      Expected.DocumentationFile = {OpenLoc, CloseLoc, name};
+      continue;
+    }
+
+    // If this check starts with 'group-name=', check for a diagnostic group
+    // name instead of a fix-it. Multiple group-name specifiers are allowed.
+    if (CheckStr.starts_with(groupNameSpecifier)) {
+      // Trim 'group-name='.
+      StringRef name = CheckStr.substr(groupNameSpecifier.size());
+      Expected.GroupNames.push_back({OpenLoc, CloseLoc, name});
+      continue;
+    }
+
+    // This wasn't a documentation file specifier, so it must be a fix-it.
+    // Special case for specifying no fixits should appear.
+    if (CheckStr == fixitExpectationNoneString) {
+      if (Expected.noneMarkerStartLoc) {
+        addError(
+            CheckStr.data() - 2,
+            Twine("A second {{") + fixitExpectationNoneString +
+                "}} was found. It may only appear once in an expectation.");
+        break;
+      }
+
+      Expected.noneMarkerStartLoc = CheckStr.data() - 2;
+      continue;
+    }
+
+    if (Expected.noneMarkerStartLoc) {
+      addError(Expected.noneMarkerStartLoc, Twine("{{") +
+                                                fixitExpectationNoneString +
+                                                "}} must be at the end.");
+      break;
+    }
+
+    if (CheckStr.empty()) {
+      addError(CheckStr.data(), Twine("expected fix-it verification within "
+                                      "braces; example: '1-2=text' or '") +
+                                    fixitExpectationNoneString + Twine("'"));
+      continue;
+    }
+
+    // Parse the pieces of the fix-it.
+    ExpectedFixIt FixIt;
+    FixIt.StartLoc = OpenLoc;
+    FixIt.EndLoc = CloseLoc;
+
+    if (const auto range =
+            parseExpectedFixItRange(CheckStr, Expected.LineNo)) {
+      FixIt.Range = range.value();
+    } else {
+      continue;
+    }
+
+    if (!CheckStr.empty() && CheckStr.front() == '=') {
+      CheckStr = CheckStr.drop_front();
+    } else {
+      addError(CheckStr.data(),
+               "expected '=' after range in fix-it verification");
+      continue;
+    }
+
+    // Translate literal "\\n" into '\n', inefficiently.
+    for (const char *current = CheckStr.begin(), *end = CheckStr.end();
+         current != end;
+         /* in loop */) {
+      if (*current == '\\' && current + 1 < end) {
+        if (current[1] == 'n') {
+          FixIt.Text += '\n';
+          current += 2;
+        } else { // Handle \}, \\, etc.
+          FixIt.Text += current[1];
+          current += 2;
+        }
+
+      } else {
+        FixIt.Text += *current++;
+      }
+    }
+
+    if (Expected.Classification == DiagnosticKindExpansion) {
+      addError(OpenLoc, "expected-expansion cannot have fixits");
+    }
+    Expected.Fixits.back().push_back(FixIt);
+  }
+
+  if (ExtraChecks.starts_with("{{children:")) {
+    Expected.ChildrenMarkerStartLoc = ExtraChecks.data();
+    ExtraChecks = ExtraChecks.substr(StringRef("{{children:").size());
+    parseNestedExpectedDiagInfoBlock(
+        BufferID, ExtraChecks, PrevExpectedContinuationLine,
+        Expected.ExpectedChildNotes, End, InExpansion);
+
+    if (End == StringRef::npos) {
+      addError(Expected.ChildrenMarkerStartLoc,
+               "didn't find '}}' to match '{{children:'");
+      return 0;
+    }
+    Expected.ChildrenMarkerEndLoc = ExtraChecks.substr(End).data();
+
+    if (!VerifyChildNotes) {
+      addError(Expected.ChildrenMarkerStartLoc,
+               "child diagnostics block requires -verify-child-notes");
+      Expected.ExpectedChildNotes.clear();
+    } else if (Expected.ExpectedChildNotes.size() == 0) {
+      addError(DiagnosticLoc, "child diagnostics block is empty");
+    }
+
+    auto ChildNote = Expected.ExpectedChildNotes.begin();
+    while (ChildNote != Expected.ExpectedChildNotes.end()) {
+      if (ChildNote->Classification != DiagnosticKind::Note) {
+        addError(ChildNote->ClassificationStart,
+                 "only notes allowed in child diagnostics block");
+        ChildNote = Expected.ExpectedChildNotes.erase(ChildNote);
+      } else {
+        ++ChildNote;
+      }
+    }
+    ExtraChecks = ExtraChecks.substr(End + 2).ltrim(" \t");
+
+    if (ExtraChecks.starts_with("{{")) {
+      addError(ExtraChecks.data(),
+               "fix-it, documentation, and group-name matchers must come "
+               "before child notes");
+    }
+  }
+
+  // If there's a trailing empty alternation, remove it.
+  if (!Expected.Fixits.empty() && Expected.Fixits.back().empty())
+    Expected.Fixits.pop_back();
+
+  Expected.ExpectedEnd = ExtraChecks.data();
+
+  // Don't include trailing whitespace in the expected-foo{{}} range.
+  while (isspace(Expected.ExpectedEnd[-1]))
+    --Expected.ExpectedEnd;
+
+  return Count;
+}
+
+void DiagnosticVerifier::verifyDiagnostics(
+    std::vector<ExpectedDiagnosticInfo> &ExpectedDiagnostics, unsigned BufferID,
+    std::optional<size_t> ParentID) {
+  // Make sure all the expected diagnostics appeared.
+  std::reverse(ExpectedDiagnostics.begin(), ExpectedDiagnostics.end());
+
+  for (unsigned i = ExpectedDiagnostics.size(); i != 0; ) {
+    --i;
+    auto &expected = ExpectedDiagnostics[i];
+
+    unsigned ID = expected.TargetBufferID.value_or(BufferID);
+    // Check to see if we had this expected diagnostic.
+    if (expected.Classification == DiagnosticKindExpansion) {
+      SourceLoc Loc = BufferID ? SM.getLocForLineCol(BufferID, expected.LineNo,
+                                                     *expected.ColumnNo)
+                               : SourceLoc();
+      auto It = Expansions.find(Loc);
+      // nextBuffer() yields std::nullopt both when no expansion was produced
+      // at this location and when every produced expansion has already been
+      // claimed by an earlier directive (i.e. there are more directives than
+      // sibling expansions). Either way this directive has nothing to bind to.
+      std::optional<unsigned> ExpansionBufferID;
+      if (It != Expansions.end())
+        ExpansionBufferID = It->second.nextBuffer();
+      if (!ExpansionBufferID) {
+        addError(expected.ExpectedStart, "expected expansion not produced");
+        continue;
+      }
+      verifyDiagnostics(expected.NestedDiags, *ExpansionBufferID,
+                        /*ParentDiagnostic=*/std::nullopt);
+      if (expected.NestedDiags.empty())
+        ExpectedDiagnostics.erase(ExpectedDiagnostics.begin()+i);
+      continue;
+    }
+    auto FoundDiagnosticInfo =
+        findDiagnostic(CapturedDiagnostics, expected, ID, SM, ParentID);
+    auto FoundDiagnosticIter = std::get<0>(FoundDiagnosticInfo);
+    if (FoundDiagnosticIter == CapturedDiagnostics.end()) {
+      // Diagnostic didn't exist.  If this is a 'mayAppear' diagnostic, then
+      // we're ok.  Otherwise, leave it in the list.
+      if (expected.mayAppear)
+        ExpectedDiagnostics.erase(ExpectedDiagnostics.begin()+i);
+      continue;
+    }
+
+    auto emitFixItsError = [&](const char *location, const Twine &message,
+                               const char *replStartLoc, const char *replEndLoc,
+                               const std::string &replStr) {
+      llvm::SMFixIt fix(llvm::SMRange(llvm::SMLoc::getFromPointer(replStartLoc),
+                                      llvm::SMLoc::getFromPointer(replEndLoc)),
+                        replStr);
+      addError(location, message, fix);
+    };
+
+    auto &FoundDiagnostic = *FoundDiagnosticIter;
+
+    if (!std::get<1>(FoundDiagnosticInfo)) {
+      // Found a diagnostic with the right location and text but the wrong
+      // classification or parent. We'll emit an error about the mismatch and
+      // thereafter pretend that the diagnostic fully matched.
+      auto expectedKind = getDiagKindString(expected.Classification);
+      auto actualKind = getDiagKindString(FoundDiagnostic.Classification);
+      if (expectedKind != actualKind)
+        emitFixItsError(expected.ClassificationStart,
+                        llvm::Twine("expected ") + expectedKind + ", not " +
+                            actualKind,
+                        expected.ClassificationStart,
+                        expected.ClassificationEnd, actualKind);
+      else {
+        ASSERT(ParentID &&
+               "fallback that matches kind but is not child note");
+        addError(expected.ExpectedStart,
+                 "matched child note with different parent");
+      }
+    }
+
+    const char *missedFixitLoc = nullptr;
+    // Verify that any expected fix-its are present in the diagnostic.
+    for (auto fixitAlternates : expected.Fixits) {
+      assert(!fixitAlternates.empty() && "an empty alternation survived");
+
+      // If we found it, we're ok.
+      if (!checkForFixIt(fixitAlternates, FoundDiagnostic)) {
+        missedFixitLoc = fixitAlternates.front().StartLoc;
+        break;
+      }
+    }
+
+    const bool isUnexpectedFixitsSeen =
+        expected.Fixits.size() < FoundDiagnostic.FixIts.size();
+
+    struct ActualFixitsPhrase {
+      std::string phrase;
+      std::string actualFixits;
+    };
+
+    auto makeActualFixitsPhrase =
+        [&](ArrayRef<CapturedFixItInfo> actualFixits) -> ActualFixitsPhrase {
+      std::string actualFixitsStr = renderFixits(actualFixits, expected.LineNo);
+
+      return ActualFixitsPhrase{(Twine("actual fix-it") +
+                                 (actualFixits.size() >= 2 ? "s" : "") +
+                                 " seen: " + actualFixitsStr).str(),
+                                actualFixitsStr};
+    };
+
+    // If we have any expected fixits that didn't get matched, then they are
+    // wrong.  Replace the failed fixit with what actually happened.
+
+    if (missedFixitLoc) {
+      // If we had an incorrect expected fixit, render it and produce a fixit
+      // of our own.
+
+      assert(!expected.Fixits.empty() &&
+             "some fix-its should be expected here");
+
+      const char *replStartLoc = expected.Fixits.front().front().StartLoc;
+      const char *replEndLoc = expected.Fixits.back().back().EndLoc;
+
+      std::string message = "expected fix-it not seen";
+      std::string actualFixits;
+
+      if (FoundDiagnostic.FixIts.empty()) {
+        /// If actual fix-its is empty,
+        /// eat a space before first marker.
+        /// For example,
+        ///
+        /// @code
+        /// expected-error {{message}} {{1-2=aa}}
+        ///                           ~~~~~~~~~~~
+        ///                           ^ remove
+        /// @endcode
+        if (replStartLoc[-1] == ' ') {
+          --replStartLoc;
+        }
+      } else {
+        auto phrase = makeActualFixitsPhrase(FoundDiagnostic.FixIts);
+        actualFixits = phrase.actualFixits;
+        message += "; " + phrase.phrase;
+      }
+
+      emitFixItsError(missedFixitLoc, message, replStartLoc, replEndLoc,
+                      actualFixits);
+    } else if (expected.noExtraFixitsMayAppear() && isUnexpectedFixitsSeen) {
+      // If unexpected fixit were produced, add a fixit to add them in.
+
+      assert(!FoundDiagnostic.FixIts.empty() &&
+             "some fix-its should be produced here");
+      assert(expected.noneMarkerStartLoc && "none marker location is null");
+
+      const char *replStartLoc = nullptr, *replEndLoc = nullptr;
+      std::string message;
+      if (expected.Fixits.empty()) {
+        message = "expected no fix-its";
+        replStartLoc = expected.noneMarkerStartLoc;
+        replEndLoc = expected.noneMarkerStartLoc;
+      } else {
+        message = "unexpected fix-it seen";
+        replStartLoc = expected.Fixits.front().front().StartLoc;
+        replEndLoc = expected.Fixits.back().back().EndLoc;
+      }
+
+      auto phrase = makeActualFixitsPhrase(FoundDiagnostic.FixIts);
+      std::string actualFixits = phrase.actualFixits;
+      message += "; " + phrase.phrase;
+
+      if (replStartLoc == replEndLoc) {
+        /// If no fix-its was expected and range of replacement is empty,
+        /// insert space after new last marker.
+        /// For example:
+        ///
+        /// @code
+        /// expected-error {{message}} {{none}}
+        ///                            ^
+        ///                    insert `{{1-2=aa}} `
+        /// @endcode
+        actualFixits += " ";
+      }
+
+      emitFixItsError(expected.noneMarkerStartLoc, message, replStartLoc,
+                      replEndLoc, actualFixits);
+    }
+
+    if (auto expectedDocFile = expected.DocumentationFile) {
+      // Verify diagnostic file.
+      if (FoundDiagnostic.CategoryDocFile == expectedDocFile->Name)
+        expectedDocFile = std::nullopt;
+
+      if (expectedDocFile) {
+        if (FoundDiagnostic.CategoryDocFile.empty()) {
+          addError(expectedDocFile->StartLoc,
+                   "expected documentation file not seen");
+        } else {
+          // If we had an incorrect expected document file, render it and
+          // produce a fixit of our own.
+          auto actual =
+              renderDocumentationFile(FoundDiagnostic.CategoryDocFile);
+          auto replStartLoc = llvm::SMLoc::getFromPointer(expectedDocFile->StartLoc);
+          auto replEndLoc = llvm::SMLoc::getFromPointer(expectedDocFile->EndLoc);
+
+          llvm::SMFixIt fix(llvm::SMRange(replStartLoc, replEndLoc), actual);
+          addError(expectedDocFile->StartLoc,
+                   "expected documentation file not seen; actual documentation "
+                   "file: " + actual, fix);
+        }
+      }
+    }
+
+    // Verify each expected diagnostic group name. The diagnostic must belong
+    // to every named group; multiple {{group-name=...}} specifiers all have
+    // to match.
+    for (const auto &expectedGroup : expected.GroupNames) {
+      bool matched = llvm::any_of(
+          FoundDiagnostic.GroupNames,
+          [&](const std::string &name) { return name == expectedGroup.Name; });
+      if (matched)
+        continue;
+
+      // Filter actual group names to exclude those that match some other
+      // expected group name on this expectation, since those have already
+      // been accounted for.
+      std::vector<StringRef> remainingActual;
+      for (const auto &name : FoundDiagnostic.GroupNames) {
+        bool isExpected = llvm::any_of(
+            expected.GroupNames,
+            [&](const ExpectedDiagnosticInfo::ExpectedGroupName &eg) {
+              return eg.Name == name;
+            });
+        if (!isExpected)
+          remainingActual.push_back(name);
+      }
+
+      if (remainingActual.empty()) {
+        addError(expectedGroup.StartLoc, "expected group name not seen");
+      } else {
+        std::string actual;
+        llvm::raw_string_ostream OS(actual);
+        llvm::interleave(
+            remainingActual,
+            [&](StringRef name) { OS << renderGroupName(name); },
+            [&] { OS << ' '; });
+
+        auto replStartLoc =
+            llvm::SMLoc::getFromPointer(expectedGroup.StartLoc);
+        auto replEndLoc = llvm::SMLoc::getFromPointer(expectedGroup.EndLoc);
+        llvm::SMFixIt fix(llvm::SMRange(replStartLoc, replEndLoc),
+                          renderGroupName(remainingActual.front()));
+        addError(expectedGroup.StartLoc,
+                 "expected group name not seen; actual group name" +
+                     std::string(remainingActual.size() > 1 ? "s" : "") +
+                     ": " + OS.str(),
+                 fix);
+      }
+    }
+
+    if (VerifyChildNotes && !expected.ExpectedChildNotes.empty()) {
+      verifyDiagnostics(expected.ExpectedChildNotes, BufferID,
+                        FoundDiagnostic.ID);
+    }
+
+    if (FoundDiagnostic.HasChildren) {
+      auto ChildNoteIter = FoundDiagnosticIter + 1;
+      while (ChildNoteIter != CapturedDiagnostics.end() &&
+             ChildNoteIter->ParentID == FoundDiagnostic.ID) {
+        addError(getRawLoc(ChildNoteIter->Loc).getPointer(),
+                 ("unexpected child note produced: " +
+                  ChildNoteIter->Message).str());
+        addNote(expected.ExpectedStart, "for parent matched here");
+        ChildNoteIter = CapturedDiagnostics.erase(ChildNoteIter);
+      }
+    }
+
+    // Actually remove the diagnostic from the list, so we don't match it
+    // again. We do have to do this after checking fix-its, though, because
+    // the diagnostic owns its fix-its.
+    CapturedDiagnostics.erase(FoundDiagnosticIter);
+
+    // We found the diagnostic, so remove it... unless we allow an arbitrary
+    // number of diagnostics, in which case we want to reprocess this.
+    if (expected.mayAppear)
+      ++i;
+    else if (expected.ExpectedChildNotes.empty())
+      ExpectedDiagnostics.erase(ExpectedDiagnostics.begin() + i);
+    else
+      expected.HasBeenFound = true;
+  }
+}
+
+void DiagnosticVerifier::verifyRemaining(
+    std::vector<ExpectedDiagnosticInfo> &ExpectedDiagnostics,
+    const char *FileStart) {
+  std::reverse(ExpectedDiagnostics.begin(), ExpectedDiagnostics.end());
+  for (auto &expected : ExpectedDiagnostics) {
+    if (expected.HasBeenFound) {
+      // Only emit errors for unmatched child notes if the parent matched.
+      verifyRemaining(expected.ExpectedChildNotes, FileStart);
+      continue;
+    }
+    if (expected.Classification == DiagnosticKindExpansion) {
+      verifyRemaining(expected.NestedDiags, FileStart);
+      continue;
+    }
+    std::string message = "expected "+getDiagKindString(expected.Classification)
+      + " not produced";
+
+    // Get the range of the expected-foo{{}} diagnostic specifier.
+    auto StartLoc = expected.ExpectedStart;
+    auto EndLoc = expected.ExpectedEnd;
+
+    // A very common case if for the specifier to be the last thing on the line.
+    // In this case, eat any trailing whitespace.
+    while (isspace(*EndLoc) && *EndLoc != '\n' && *EndLoc != '\r')
+      ++EndLoc;
+
+    // If we found the end of the line, we can do great things.  Otherwise,
+    // avoid nuking whitespace that might be zapped through other means.
+    if (*EndLoc != '\n' && *EndLoc != '\r') {
+      EndLoc = expected.ExpectedEnd;
+    } else {
+      // If we hit the end of line, then zap whitespace leading up to it.
+      while (StartLoc-1 != FileStart && isspace(StartLoc[-1]) &&
+             StartLoc[-1] != '\n' && StartLoc[-1] != '\r')
+        --StartLoc;
+
+      // If we got to the end of the line, and the thing before this diagnostic
+      // is a "//" then we can remove it too.
+      if (StartLoc-2 >= FileStart && StartLoc[-1] == '/' && StartLoc[-2] == '/')
+        StartLoc -= 2;
+
+      // Perform another round of general whitespace nuking to cleanup
+      // whitespace before the //.
+      while (StartLoc-1 != FileStart && isspace(StartLoc[-1]) &&
+             StartLoc[-1] != '\n' && StartLoc[-1] != '\r')
+        --StartLoc;
+
+      // If we found a \n, then we can nuke the entire line.
+      if (StartLoc-1 != FileStart &&
+          (StartLoc[-1] == '\n' || StartLoc[-1] == '\r'))
+        --StartLoc;
+    }
+
+    // Remove the expected-foo{{}} as a fixit.
+    llvm::SMFixIt fixIt(llvm::SMRange{
+      llvm::SMLoc::getFromPointer(StartLoc),
+      llvm::SMLoc::getFromPointer(EndLoc)
+    }, "");
+    addError(expected.ExpectedStart, message, fixIt);
+  }
+}
+
+void DiagnosticVerifier::addError(const char *Loc, const Twine &message,
+                                  ArrayRef<llvm::SMFixIt> FixIts) {
+  auto loc = SourceLoc::getFromPointer(Loc);
+  Errors.emplace_back(
+      SM.GetMessage(loc, llvm::SourceMgr::DK_Error, message, {}, FixIts));
+}
+
+void DiagnosticVerifier::addNote(const char *Loc, const Twine &message) {
+  ASSERT(!Errors.empty() && "addNote requires a preceding addError");
+  auto loc = SourceLoc::getFromPointer(Loc);
+  Errors.back().Notes.emplace_back(
+      SM.GetMessage(loc, llvm::SourceMgr::DK_Note, message, {}, {}));
+}
+
+std::vector<CapturedDiagnosticInfo>::iterator
+DiagnosticVerifier::reportAndEraseUnexpected(
+    std::vector<CapturedDiagnosticInfo>::iterator DiagIter) {
+  bool isInUnknown = !DiagIter->SourceBufferID;
+  bool shouldIgnore = isInUnknown && IgnoreUnknown;
+
+  // If this is in <unknown> and we're ignoring unexpected diagnostics there,
+  // don't diagnose it, just erase it.
+  if (!shouldIgnore) {
+    addError(getRawLoc(DiagIter->Loc).getPointer(),
+             ("unexpected " + getDiagKindString(DiagIter->Classification) +
+              " produced: " + DiagIter->Message)
+                 .str());
+  }
+
+  if (VerifyChildNotes) {
+    auto ChildIter = DiagIter + 1;
+    // All child notes occur immediately after their parent so we only need to
+    // look forward in the list for as long as we keep seeing child notes. This
+    // also lets us erase the child notes without invalidating DiagIter.
+    while (ChildIter != CapturedDiagnostics.end() &&
+           ChildIter->ParentID == DiagIter->ID) {
+      if (!shouldIgnore) {
+        addNote(getRawLoc(ChildIter->Loc).getPointer(),
+                ("with child note: " + ChildIter->Message).str());
+      }
+      ChildIter = CapturedDiagnostics.erase(ChildIter);
+    }
+  }
+
+  if (!shouldIgnore && isInUnknown) {
+    addNote(getRawLoc(DiagIter->Loc).getPointer(),
+            "use '-verify-ignore-unknown' to ignore diagnostics at this "
+            "location");
+  }
+
+  return CapturedDiagnostics.erase(DiagIter);
+}
+
+/// Invoke \p Callback for each location marker definition of the form "// #name"
+/// found in \p Text. \p HashLoc points at the '#' and \p Name is the marker
+/// name. A marker definition is a comment whose only content is "#name", e.g.:
+///   code // #marker1
+///   // #marker2
+/// The marker name consists of alphanumeric characters, hyphens, or
+/// underscores. Nothing else may appear in the comment after the marker name
+/// (except trailing whitespace). This prevents false positives from comments
+/// like "// #available(...)" or stack traces containing "// #10 0x...".
+///
+/// For the extended form "// #name@N" \p ExpansionLine is set to N.
+static void forEachMarkerDefinition(
+    StringRef Text,
+    llvm::function_ref<void(const char *HashLoc, StringRef Name,
+                            std::optional<unsigned> ExpansionLine)>
+        Callback) {
+  for (size_t Pos = Text.find("//"); Pos != StringRef::npos;
+       Pos = Text.find("//", Pos + 2)) {
+    size_t Cur = Pos + 2;
+    while (Cur < Text.size() && (Text[Cur] == ' ' || Text[Cur] == '\t'))
+      ++Cur;
+
+    if (Cur >= Text.size() || Text[Cur] != '#')
+      continue;
+
+    size_t HashPos = Cur;
+    size_t NameStart = HashPos + 1;
+    size_t NameEnd = NameStart;
+    while (NameEnd < Text.size() &&
+           (isalnum(Text[NameEnd]) || Text[NameEnd] == '_' ||
+            Text[NameEnd] == '-'))
+      ++NameEnd;
+
+    if (NameEnd == NameStart)
+      continue;
+
+    // An optional '@N' suffix binds the marker to line N of the expansion.
+    size_t Rest = NameEnd;
+    std::optional<unsigned> ExpansionLine;
+    if (Rest < Text.size() && Text[Rest] == '@') {
+      size_t NumStart = Rest + 1;
+      size_t NumEnd = NumStart;
+      while (NumEnd < Text.size() && Text[NumEnd] >= '0' && Text[NumEnd] <= '9')
+        ++NumEnd;
+      // '@' not followed by a line number: not a marker definition.
+      if (NumEnd == NumStart)
+        continue;
+      unsigned Line;
+      if (Text.slice(NumStart, NumEnd).getAsInteger(10, Line))
+        continue;
+      ExpansionLine = Line;
+      Rest = NumEnd;
+    }
+
+    // Only trailing whitespace is allowed after the marker until EOL.
+    while (Rest < Text.size() && (Text[Rest] == ' ' || Text[Rest] == '\t'))
+      ++Rest;
+    if (Rest < Text.size() && Text[Rest] != '\n' && Text[Rest] != '\r' &&
+        Text[Rest] != '\0')
+      continue;
+
+    Callback(Text.data() + HashPos, Text.slice(NameStart, NameEnd),
+             ExpansionLine);
+  }
+}
+
+/// Scan the buffer for location marker definitions and register them.
+void DiagnosticVerifier::scanForMarkers(unsigned BufferID) {
+  ASSERT(BufferID);
+
+  StringRef InputFile = SM.getEntireTextForBuffer(BufferID);
+  const SourceLoc BufferStartLoc = SM.getLocForBufferStart(BufferID);
+
+  forEachMarkerDefinition(
+      InputFile, [&](const char *HashLoc, StringRef MarkerName,
+                     std::optional<unsigned> ExpansionLine) {
+        // An expansion-relative marker ('// #name@N') cannot be bound to a
+        // location yet: its expansion buffer is only known once the enclosing
+        // expected-expansion block is parsed. Register the name now with a
+        // null buffer ID, to be filled in later.
+        if (ExpansionLine) {
+          auto Result = LocationMarkers.try_emplace(
+              MarkerName, MarkerLocation{/*BufferID=*/std::nullopt,/*Line=*/0});
+          if (!Result.second)
+            addError(HashLoc,
+                     "location marker '#" + MarkerName + "' already defined");
+          return;
+        }
+
+        unsigned Line = SM.getLineAndColumnInBuffer(
+                              BufferStartLoc.getAdvancedLoc(HashLoc -
+                                                            InputFile.data()),
+                              BufferID)
+                            .first;
+
+        auto Result = LocationMarkers.try_emplace(
+            MarkerName, MarkerLocation{BufferID, Line});
+        if (!Result.second) {
+          addError(HashLoc,
+                   "location marker '#" + MarkerName + "' already defined");
+        }
+      });
+}
+
+/// Handle location marker definitions found inside an expected-expansion block.
+void DiagnosticVerifier::processExpansionMarkerDefinitions(
+    StringRef BlockText, std::optional<unsigned> ExpansionBufferID) {
+  forEachMarkerDefinition(
+      BlockText, [&](const char *HashLoc, StringRef MarkerName,
+                     std::optional<unsigned> ExpansionLine) {
+        if (!ExpansionLine) {
+          // A plain '// #name' names a physical line in the outer buffer, not a
+          // location in the virtual expansion buffer the nested diagnostics are
+          // verified against. Ban this footgun; use '// #name@N' instead.
+          addError(HashLoc, "location marker '#" + MarkerName +
+                                "' inside expected-expansion must use '#" +
+                                MarkerName + "@LineNo' syntax");
+          return;
+        }
+
+        // Record the definition site so that a '#name@N' marker appearing
+        // outside any expansion block can be diagnosed. This is done regardless
+        // of whether the binding below succeeds, since being inside an
+        // expansion block is a syntactic fact independent of bind success.
+        ExpansionMarkerLocs.insert(HashLoc);
+
+        // '// #name@N' binds the marker to line N of the expansion buffer. If
+        // the expansion was not produced we cannot bind it; the separate
+        // "expected expansion not produced" error covers that case.
+        if (!ExpansionBufferID)
+          return;
+
+        if (SM.getLocForLineCol(*ExpansionBufferID, *ExpansionLine, 1)
+                .isInvalid()) {
+          addError(HashLoc, "line " + Twine(*ExpansionLine) +
+                                " does not exist in the expansion buffer");
+          return;
+        }
+
+        // The name was registered by scanForMarkers() before parsing; bind it
+        // to its expansion-buffer location now that the buffer is known. A
+        // non-sentinel entry here means a duplicate definition (already
+        // diagnosed by the pre-scan), so leave the first binding in place rather
+        // than clobbering it.
+        MarkerLocation &MarkerLoc = LocationMarkers[MarkerName];
+        if (!MarkerLoc.BufferID.has_value())
+          MarkerLoc = {*ExpansionBufferID, *ExpansionLine};
+      });
+}
+
+/// Resolve deferred '@#marker' references now that every expansion block's
+/// markers have been bound.
+void DiagnosticVerifier::resolveDeferredMarkers(
+    std::vector<ExpectedDiagnosticInfo> &Diags) {
+  for (auto It = Diags.begin(); It != Diags.end();) {
+    auto &D = *It;
+    if (!D.DeferredMarkerName.empty()) {
+      // Only markers that are known to exist are ever deferred (undefined ones
+      // are diagnosed during parsing), so the name is guaranteed to be present.
+      auto Marker = LocationMarkers.find(D.DeferredMarkerName);
+      ASSERT(Marker != LocationMarkers.end() &&
+             "deferred reference to an unknown marker");
+      if (!Marker->second.BufferID.has_value()) {
+        // The '// #name@N' definition could not be bound -- e.g. its expansion
+        // was not produced, its line does not exist, or it appeared outside any
+        // expansion. Each of those is diagnosed at the definition site, so just
+        // drop this dependent expected diagnostic instead of adding a confusing
+        // "undefined marker" error or a spurious "not produced" error.
+        It = Diags.erase(It);
+        continue;
+      }
+      D.LineNo = Marker->second.Line;
+      D.TargetBufferID = Marker->second.BufferID;
+      D.DeferredMarkerName = StringRef();
+    }
+    resolveDeferredMarkers(D.ExpectedChildNotes);
+    resolveDeferredMarkers(D.NestedDiags);
+    ++It;
+  }
+}
+
+
+bool DiagnosticVerifier::hasMarkerAtLine(unsigned BufferID,
+                                         unsigned Line) const {
+  for (const auto &Entry : LocationMarkers) {
+    if (Entry.second.BufferID == BufferID && Entry.second.Line == Line)
+      return true;
+  }
+  return false;
+}
+
+bool DiagnosticVerifier::verifyDeferredMarkerDiagnostics() {
+  Errors.clear();
+  bool HadError = false;
+  auto CapturedDiagIter = CapturedDiagnostics.begin();
+  while (CapturedDiagIter != CapturedDiagnostics.end()) {
+    if (!CapturedDiagIter->SourceBufferID ||
+        !hasMarkerAtLine(CapturedDiagIter->SourceBufferID,
+                         CapturedDiagIter->Line)) {
+      ++CapturedDiagIter;
+      continue;
+    }
+    HadError = true;
+    CapturedDiagIter = reportAndEraseUnexpected(CapturedDiagIter);
+  }
+  for (auto &Err : Errors)
+    printDiagnostic(Err);
+  Errors.clear();
+  return HadError;
+}
+
+/// After the file has been processed, check to see if we got all of
+/// the expected diagnostics and check to see if there were any unexpected
+/// ones.
+DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
+  Errors.clear();
+  ExpansionMarkerLocs.clear();
+  using llvm::SMLoc;
+
+  StringRef InputFile = BufferID ? SM.getEntireTextForBuffer(BufferID) : "";
+
+  // Queue up all of the diagnostics, allowing us to sort them and emit them in
+  // file order.
+
+  unsigned PrevExpectedContinuationLine = 0;
+
+  std::vector<ExpectedDiagnosticInfo> ExpectedDiagnostics;
+
+  // Validate that earlier prefixes are not prefixes of alter
+  // prefixes... otherwise, we will never pattern match the later prefix.
+  validatePrefixList(AdditionalExpectedPrefixes);
+
+  const char *PrevMatchEnd = InputFile.data();
+  // Scan the memory buffer looking for expected-note/warning/error.
+  for (size_t Match = InputFile.find("expected-");
+       Match != StringRef::npos; Match = InputFile.find("expected-", Match+1)) {
+    // Process this potential match.  If we fail to process it, just move on to
+    // the next match.
+    StringRef MatchStart = InputFile.substr(Match);
+    if (MatchStart.data() < PrevMatchEnd)
+      continue;
+    ExpectedDiagnosticInfo Expected(nullptr, nullptr, nullptr, DiagnosticKind(-1));
+    unsigned Count = parseExpectedDiagInfo(BufferID, MatchStart, PrevExpectedContinuationLine, Expected);
+    if (Count < 1)
+      continue;
+
+    // Add the diagnostic the expected number of times.
+    for (; Count; --Count)
+      ExpectedDiagnostics.push_back(Expected);
+    PrevMatchEnd = Expected.ExpectedEnd;
+  }
+
+  resolveDeferredMarkers(ExpectedDiagnostics);
+  forEachMarkerDefinition(
+      InputFile, [&](const char *HashLoc, StringRef MarkerName,
+                     std::optional<unsigned> ExpansionLine) {
+        if (!ExpansionLine)
+          return;
+        if (ExpansionMarkerLocs.count(HashLoc))
+          return;
+        addError(HashLoc, "location marker '#" + MarkerName + "@" +
+                              Twine(*ExpansionLine) +
+                              "' is only allowed inside expected-expansion");
+      });
+
+  verifyDiagnostics(ExpectedDiagnostics, BufferID,
+                    /*ParentDiagnostic=*/std::nullopt);
+
+  // Check to see if we have any incorrect diagnostics.  If so, diagnose them as
+  // such.
+  auto expectedDiagIter = ExpectedDiagnostics.begin();
+  while (expectedDiagIter != ExpectedDiagnostics.end()) {
+    if (expectedDiagIter->HasBeenFound) {
+      // FIXME: extract this "near miss" pass and recurse
+      // over child notes and expansion contents
+      ++expectedDiagIter;
+      continue;
+    }
+    // Check to see if any found diagnostics have the right line and
+    // classification, but the wrong text.
+    auto I = CapturedDiagnostics.begin();
+    for (auto E = CapturedDiagnostics.end(); I != E; ++I) {
+      // Verify the file and line of the diagnostic.
+      if (I->Line != expectedDiagIter->LineNo || I->SourceBufferID != BufferID
+            || I->Classification != expectedDiagIter->Classification)
+        continue;
+
+      // Otherwise, we found it, break out.
+      break;
+    }
+
+    if (I == CapturedDiagnostics.end()) {
+      ++expectedDiagIter;
+      continue;
+    }
+
+    if (I->Message.find(expectedDiagIter->MessageStr) == StringRef::npos) {
+      auto StartLoc =
+          SMLoc::getFromPointer(expectedDiagIter->MessageRange.begin());
+      auto EndLoc = SMLoc::getFromPointer(expectedDiagIter->MessageRange.end());
+
+      llvm::SMFixIt fixIt(llvm::SMRange{StartLoc, EndLoc}, I->Message);
+      addError(expectedDiagIter->MessageRange.begin(),
+               "incorrect message found", fixIt);
+    } else if (I->Column != *expectedDiagIter->ColumnNo) {
+      // The difference must be only in the column
+      addError(expectedDiagIter->MessageRange.begin(),
+               llvm::formatv("message found at column {0} but was expected to "
+                             "appear at column {1}",
+                             I->Column, *expectedDiagIter->ColumnNo));
+    } else {
+      llvm_unreachable("unhandled difference from expected diagnostic");
+    }
+    CapturedDiagnostics.erase(I);
+    expectedDiagIter = ExpectedDiagnostics.erase(expectedDiagIter);
+  }
+
+  // Diagnose expected diagnostics that didn't appear.
+  verifyRemaining(ExpectedDiagnostics, InputFile.data());
+
+  // Verify that there are no diagnostics (in MemoryBuffer) left in the list.
+  bool HadUnexpectedDiag = false;
+  auto CapturedDiagIter = CapturedDiagnostics.begin();
+  while (CapturedDiagIter != CapturedDiagnostics.end()) {
+    if (CapturedDiagIter->SourceBufferID != BufferID) {
+      if (!CapturedDiagIter->SourceBufferID || !BufferID){
+        ++CapturedDiagIter;
+        continue;
+      }
+
+      // Diagnostics attached to generated sources originating in this
+      // buffer also count as part of this buffer for this purpose.
+      unsigned scratch;
+      llvm::ArrayRef<unsigned> ancestors =
+          SM.getAncestors(CapturedDiagIter->SourceBufferID, scratch);
+      if (llvm::find(ancestors, BufferID) == ancestors.end()) {
+        ++CapturedDiagIter;
+        continue;
+      }
+    }
+
+    // Defer reporting unexpected diagnostics on lines with location markers,
+    // because another file may have an expected-error@#marker for this line.
+    if (hasMarkerAtLine(BufferID, CapturedDiagIter->Line)) {
+      ++CapturedDiagIter;
+      continue;
+    }
+
+    HadUnexpectedDiag |= (CapturedDiagIter->SourceBufferID || !IgnoreUnknown);
+    CapturedDiagIter = reportAndEraseUnexpected(CapturedDiagIter);
+  }
+
+  // Sort the diagnostics with buffer ID as the primary key and address within
+  // the buffer as the secondary key. This ensures that an "unexpected
+  // diagnostic" and "expected diagnostic" in the same place are emitted next
+  // to each other, and that the order is stable across source files.
+  std::stable_sort(Errors.begin(), Errors.end(),
+            [&](const SMDiagnosticWithNotes &lhs,
+                const SMDiagnosticWithNotes &rhs) -> bool {
+              auto lhsLoc = SourceLoc::getFromPointer(lhs.Diag.getLoc().getPointer());
+              auto rhsLoc = SourceLoc::getFromPointer(rhs.Diag.getLoc().getPointer());
+
+              // Sort invalid SourceLocs last
+              if (lhsLoc.isInvalid())
+                return false;
+              if (rhsLoc.isInvalid())
+                return true;
+
+              unsigned lhsBuf = SM.findBufferContainingLoc(lhsLoc);
+              unsigned rhsBuf = SM.findBufferContainingLoc(rhsLoc);
+              if (lhsBuf != rhsBuf)
+                return lhsBuf < rhsBuf;
+              return lhs.Diag.getLoc().getPointer() <
+                     rhs.Diag.getLoc().getPointer();
+            });
+
+  // Emit all of the queue'd up errors.
+  for (const auto &Err : Errors)
+    printDiagnostic(Err);
+
+  // If auto-apply fixits is on, rewrite the original source file.
+  if (AutoApplyFixes)
+    autoApplyFixes(SM, BufferID, Errors);
+
+  return Result{!Errors.empty(), HadUnexpectedDiag};
+}
+
+void DiagnosticVerifier::printRemainingDiagnostics() const {
+  for (const auto &diag : CapturedDiagnostics) {
+    // Determine what kind of diagnostic we're emitting.
+    llvm::SourceMgr::DiagKind SMKind;
+    switch (diag.Classification) {
+    case DiagnosticKind::Error:
+      SMKind = llvm::SourceMgr::DK_Error;
+      break;
+    case DiagnosticKind::Warning:
+      SMKind = llvm::SourceMgr::DK_Warning;
+      break;
+
+    case DiagnosticKind::Note:
+      SMKind = llvm::SourceMgr::DK_Note;
+      break;
+
+    case DiagnosticKind::Remark:
+      SMKind = llvm::SourceMgr::DK_Remark;
+      break;
+    }
+
+    auto message =
+        SM.GetMessage(diag.Loc, SMKind,
+                      "diagnostic produced elsewhere: " + diag.Message.str(),
+                      /*Ranges=*/{}, {});
+    printDiagnostic(message);
+  }
+}
+
+// Build the ordering key for a sibling macro expansion (see ExpansionOrderKey).
+static DiagnosticVerifier::ExpansionContext::ExpansionOrderKey
+computeExpansionOrderKey(SourceManager &SM, const GeneratedSourceInfo &GSI,
+                         unsigned expansionBufferID) {
+  DiagnosticVerifier::ExpansionContext::ExpansionOrderKey Key;
+  Key.content = SM.getEntireTextForBuffer(expansionBufferID);
+
+  SourceLoc AttrLoc;
+  if (GSI.attachedMacroCustomAttr)
+    AttrLoc = GSI.attachedMacroCustomAttr->getLocation();
+  if (AttrLoc.isInvalid())
+    AttrLoc = GSI.originalSourceRange.getStart();
+  if (AttrLoc.isValid()) {
+    Key.anchorBufferID = SM.findBufferContainingLoc(AttrLoc);
+    Key.anchorOffset = SM.getLocOffsetInBuffer(AttrLoc, Key.anchorBufferID);
+  }
+  return Key;
+}
+
+static void
+processExpansions(SourceManager &SM, llvm::DenseMap<SourceLoc, DiagnosticVerifier::ExpansionContext> &Expansions,
+                  std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics) {
+  for (auto &diag : CapturedDiagnostics) {
+    if (!diag.SourceBufferID)
+      continue;
+    const GeneratedSourceInfo *GSI =
+        SM.getGeneratedSourceInfo(diag.SourceBufferID);
+    if (!GSI)
+      continue;
+    SourceLoc ExpansionStart = GSI->originalSourceRange.getStart();
+    if (ExpansionStart.isInvalid())
+      continue;
+    Expansions[ExpansionStart].addBuffer(
+        diag.SourceBufferID,
+        computeExpansionOrderKey(SM, *GSI, diag.SourceBufferID));
+  }
+}
+
+static void createDiagnosticInfo(const DiagnosticInfo &Info,
+                                 SourceManager &DiagSM,
+                                 SourceManager &VerifierSM,
+                                 bool VerifyChildNotes,
+                                 bool IgnoreMacroLocationNote,
+                                 std::optional<size_t> ParentID,
+                                 std::vector<CapturedDiagnosticInfo> &Out) {
+  ASSERT(!Info.IsChildNote ||
+         Info.ChildDiagnosticInfo.empty() && "child note of child note??");
+  SmallVector<CapturedFixItInfo, 2> fixIts;
+  for (const auto &fixIt : Info.FixIts) {
+    fixIts.emplace_back(DiagSM, fixIt);
+  }
+
+  llvm::SmallString<128> message;
+  {
+    llvm::raw_svector_ostream Out(message);
+    DiagnosticEngine::formatDiagnosticText(Out, Info.FormatString,
+                                           Info.FormatArgs);
+  }
+
+  std::vector<std::string> groupNames;
+  groupNames.reserve(Info.CategoryChain.size());
+  for (const auto &category : Info.CategoryChain)
+    groupNames.emplace_back(category.Name.str());
+
+  SmallVector<const DiagnosticInfo *, 8> ChildNotes;
+  if (VerifyChildNotes) {
+    for (auto &ChildInfo : Info.ChildDiagnosticInfo) {
+      if (IgnoreMacroLocationNote &&
+          ChildInfo->ID == diag::in_macro_expansion.ID)
+        continue;
+      ChildNotes.push_back(ChildInfo);
+    }
+  }
+
+  DiagLoc loc(DiagSM, VerifierSM, Info.Loc);
+  const size_t Idx = Out.size();
+  Out.emplace_back(
+      message, loc.bufferID, Info.Kind, loc.sourceLoc, loc.line, loc.column,
+      fixIts, llvm::sys::path::stem(Info.getCategoryDocumentationURL()).str(),
+      std::move(groupNames), Idx, ParentID, !ChildNotes.empty());
+
+  for (const DiagnosticInfo *ChildInfo : ChildNotes) {
+    createDiagnosticInfo(*ChildInfo, DiagSM, VerifierSM, VerifyChildNotes,
+                         IgnoreMacroLocationNote, Idx, Out);
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Main entrypoints
+//===----------------------------------------------------------------------===//
+
+/// Every time a diagnostic is generated in -verify mode, this function is
+/// called with the diagnostic.  We just buffer them up until the end of the
+/// file.
+void DiagnosticVerifier::handleDiagnostic(SourceManager &SM,
+                                          const DiagnosticInfo &Info) {
+  // Ignore "fatal error encountered while in -verify mode" errors,
+  // because there's no reason to verify them.
+  if (Info.ID == diag::verify_encountered_fatal.ID)
+    return;
+  if (IgnoreMacroLocationNote && Info.ID == diag::in_macro_expansion.ID)
+    return;
+  if (VerifyChildNotes && Info.IsChildNote)
+    // Already added with parent diagnostic
+    return;
+
+  createDiagnosticInfo(Info, SM, this->SM, VerifyChildNotes,
+                       IgnoreMacroLocationNote, std::nullopt,
+                       CapturedDiagnostics);
+}
+
+/// Once all diagnostics have been captured, perform verification.
+bool DiagnosticVerifier::finishProcessing() {
+  DiagnosticVerifier::Result Result = {false, false};
+
+  SmallVector<unsigned, 4> additionalBufferIDs;
+  for (auto path : AdditionalFilePaths) {
+    auto bufferID = SM.getIDForBufferIdentifier(path);
+    if (!bufferID) {
+      // Still need to scan this file for expectations.
+      auto result = SM.getFileSystem()->getBufferForFile(path);
+      if (!result) {
+        auto message = SM.GetMessage(
+           SourceLoc(), llvm::SourceMgr::DiagKind::DK_Error,
+           llvm::Twine("unable to open file in '-verify-additional-file ") +
+           path + "': " + result.getError().message(), {}, {});
+        printDiagnostic(message);
+        Result.HadError |= true;
+        continue;
+      }
+      bufferID = SM.addNewSourceBuffer(std::move(result.get()));
+    }
+    if (bufferID) {
+      additionalBufferIDs.push_back(*bufferID);
+    }
+  }
+
+  processExpansions(SM, Expansions, CapturedDiagnostics);
+
+  // Scan all buffers for location marker definitions before verifying, so
+  // that markers defined in one file can be referenced from another.
+  ArrayRef<unsigned> BufferIDLists[2] = { BufferIDs, additionalBufferIDs };
+  for (ArrayRef<unsigned> BufferIDList : BufferIDLists)
+    for (auto &BufferID : BufferIDList)
+      scanForMarkers(BufferID);
+
+  // Emit any errors from marker scanning (e.g. duplicate marker definitions)
+  // before verifyFile() clears the Errors vector.
+  for (auto &Err : Errors)
+    printDiagnostic(Err);
+  if (!Errors.empty())
+    Result.HadError = true;
+  Errors.clear();
+
+  for (ArrayRef<unsigned> BufferIDList : BufferIDLists)
+    for (auto &BufferID : BufferIDList) {
+      Result |= verifyFile(BufferID);
+    }
+
+  // Now that all files have been verified, check for any remaining diagnostics
+  // on lines with markers that were deferred during per-file verification.
+  if (verifyDeferredMarkerDiagnostics()) {
+    Result.HadError = true;
+    Result.HadUnexpectedDiag = true;
+  }
+
+  // Verify diagnostics at <unknown>:0
+  Result |= verifyFile(InvalidBufferID);
+
+  if (!IgnoreUnrelated) {
+    bool HadError = verifyUnrelated(CapturedDiagnostics);
+    Result.HadError |= HadError;
+    Result.HadUnexpectedDiag |= HadError;
+  }
+
+  if (Result.HadUnexpectedDiag)
+    printRemainingDiagnostics();
+
+  return Result.HadError;
+}

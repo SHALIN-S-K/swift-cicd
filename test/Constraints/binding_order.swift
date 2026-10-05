@@ -1,0 +1,489 @@
+// RUN: %target-typecheck-verify-swift -verify-ignore-unrelated -solver-enable-diagnose-valid-salvage -verify-additional-prefix salvage-
+// RUN: %target-typecheck-verify-swift -verify-ignore-unrelated -solver-disable-diagnose-valid-salvage
+
+// The next two sets of examples cause difficulties because our
+// subtype lattice is not actually a lattice; existentials fail
+// to satisfy the absorbtion laws. In other words, given two
+// concrete types, we cannot always compute an accurate upper
+// bound, because we don't know what protocol conformances they
+// might have in common; all we can fall back on is their
+// superclass. So if we bind the join type too soon, certain
+// expressions will fail.
+
+protocol Command {
+  var name: String { get }
+  static var id: Int { get }
+}
+
+extension Command {
+  var name: String { return "" }
+  static var id: Int { return 0 }
+}
+
+// Originally from rdar://35088384:
+//
+// This used to crash in Xcode 9 GM, and fails with a diagnostic in more
+// recent swift-4.0-branch builds, because we incorrectly infer the type
+// of the array literal as [Any].
+do {
+  struct Undo: Command {}
+  struct Cut: Command {}
+  struct Copy: Command {}
+  struct Paste: Command {}
+
+  let _: Array<any Command> = [Cut(), Copy(), Paste()]
+  let _: Array<(any Command)?> = [Cut(), Copy(), Paste()]
+  let _: Array<any Command.Type> = [Cut.self, Copy.self, Paste.self]
+  let _: Array<(any Command.Type)?> = [Cut.self, Copy.self, Paste.self]
+
+  let _ = Array<any Command>([Cut(), Copy(), Paste()])
+  let _ = Array<(any Command)?>([Cut(), Copy(), Paste()])
+  let _ = Array<any Command.Type>([Cut.self, Copy.self, Paste.self])
+  let _ = Array<(any Command.Type)?>([Cut.self, Copy.self, Paste.self])
+
+  var commands1: [any Command] = [Undo(), Cut()]
+  commands1.append(contentsOf: [Copy(), Paste()])
+
+  var commands2: [any Command.Type] = [Undo.self, Cut.self]
+  commands2.append(contentsOf: [Copy.self, Paste.self])
+
+  var commands3: [(any Command)?] = [Undo(), Cut()]
+  commands3.append(contentsOf: [Copy(), Paste()])
+
+  var commands4: [(any Command.Type)?] = [Undo.self, Cut.self]
+  commands4.append(contentsOf: [Copy.self, Paste.self])
+
+  func perform1<S: Sequence>(_: S) where S.Element == Any {}
+  perform1([Undo(), Cut(), Copy()])
+
+  func perform2<S: Sequence>(_: S) where S.Element == Any.Type {}
+  perform2([Undo.self, Cut.self, Copy.self])
+
+  func perform3<S: Sequence>(_: S) where S.Element == Any? {}
+  perform3([Undo(), Cut(), Copy()])
+
+  func perform4<S: Sequence>(_: S) where S.Element == Any.Type? {}
+  perform4([Undo.self, Cut.self, Copy.self])
+
+  let _: [String: any Command] = Dictionary(
+    uniqueKeysWithValues: [Undo(), Cut(), Copy(), Paste()].map { ($0.name, $0) })
+  // expected-error@-1 {{value of type 'Any' has no member 'name'}}
+  // expected-note@-2 {{cast 'Any' to 'AnyObject' or use 'as!' to force downcast to a more specific type to access members}}
+
+  let _: [String: (any Command)?] = Dictionary(
+    uniqueKeysWithValues: [Undo(), Cut(), Copy(), Paste()].map { ($0.name, $0) })
+  // expected-error@-1 {{value of type 'Any' has no member 'name}}
+  // expected-note@-2 {{cast 'Any' to 'AnyObject' or use 'as!' to force downcast to a more specific type to access members}}
+
+  let _: [Int: any Command.Type] = Dictionary(
+    uniqueKeysWithValues: [Undo.self, Cut.self, Copy.self, Paste.self].map { ($0.id, $0) })
+
+  let _: [Int: (any Command.Type)?] = Dictionary(
+    uniqueKeysWithValues: [Undo.self, Cut.self, Copy.self, Paste.self].map { ($0.id, $0) })
+}
+
+// rdar://problem/38159133
+// https://github.com/apple/swift/issues/49673
+// Swift 4.1 Xcode 9.3b4 regression
+
+do {
+  class Super {}
+  class A: Super, Command {}
+  class B: Super, Command {}
+
+  // Some of these might be hard to resolve, but we should produce better diagnostics.
+  func rdar38159133(a: A, b: B, aOpt: A?, bOpt: B?) {
+    let _ = Array<any Command>([a, b])
+    let _: [any Command] = [a, b]
+    let _: [any Command] = Array([a, b])
+    let _: [any Command] = [a, b].filter { _ in true }
+    let _: [any Command] = [aOpt, bOpt].compactMap { $0 }
+
+    let _: [any Command] = [aOpt, bOpt].filter { $0 != nil }
+    // expected-error@-1 {{cannot convert value of type 'A?' to expected element type 'any Command'}}
+    // expected-error@-2 {{cannot convert value of type 'B?' to expected element type 'any Command'}}
+    let _: [any Command] = [a, b].map { $0 }
+    // expected-error@-1 {{cannot convert value of type 'Super' to closure result type 'any Command'}}
+    let _: [any Command] = [a, b].flatMap { [$0] }
+    // expected-error@-1 {{cannot convert value of type '[Super]' to closure result type '(any Command)?'}}
+
+    let _: [any Command] = [[a], [b]].flatMap { $0 }
+    // expected-salvage-error@-1 {{failed to produce diagnostic for expression; please submit a bug report}}
+  }
+}
+
+do {
+  // This works!
+  let _: [ObjectIdentifier: Bool] = .init(uniqueKeysWithValues: [
+    Optional<String>.self, Int.self
+  ].map { (ObjectIdentifier($0), false) })
+
+  // This works!
+  let _: [ObjectIdentifier: Bool] = .init(uniqueKeysWithValues: [
+    String.self, Optional<String>.self, Array<String>.self
+  ].map { (ObjectIdentifier($0), false) })
+
+  // This works too!
+  let _: [ObjectIdentifier: Bool] = .init(uniqueKeysWithValues: [
+    String.self, Optional<String>.self, Array<String>.self, Int.self
+  ].map { (ObjectIdentifier($0), false) })
+}
+
+// This expression first appeared in test/embedded/dict-init.swift.
+// Test some variations.
+do {
+  let _ = Dictionary(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Int, String>(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Double, String>(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Int, StaticString>(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Double, StaticString>(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+
+  let _ = Dictionary.init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Int, String>.init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Double, String>.init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Int, StaticString>.init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _ = Dictionary<Double, StaticString>.init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+
+  let _: Dictionary = .init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _: Dictionary<Int, String> = .init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _: Dictionary<Double, String> = .init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _: Dictionary<Int, StaticString> = .init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+  let _: Dictionary<Double, StaticString> = .init(uniqueKeysWithValues: [(10, "hello"), (20, "world")])
+}
+
+// Another contentsOf: funny case.
+do {
+  let x = ""
+  var s1: [(a: String, b: String)] = []
+  s1.append(contentsOf: [(x, "")])
+  s1.append(contentsOf: [(x, ""), (x, "")])
+  s1.append(contentsOf: [(x, ""), (x, ""), (x, "")])
+
+  var s2: [(a: String, b: Int?)] = []
+  s2.append(contentsOf: [(x, 3)])
+  s2.append(contentsOf: [(x, 3), (x, 4)])
+  s2.append(contentsOf: [(x, 3), (x, 4), (x, 4)])
+
+  var s3: [(a: String?, b: Int)] = []
+  s3.append(contentsOf: [(x, 3)])
+  s3.append(contentsOf: [(x, 3), (x, 4)])
+  s3.append(contentsOf: [(x, 3), (x, 4), (x, 4)])
+}
+
+// More tuple label weirdness
+do {
+  func g(_: [(a: Int, b: Int)]) {}
+
+  let x = 0
+  let y = 1
+
+  func f(b: Bool) {
+      g([(aa: x, bb: x), (y, y)])
+      g(b ? [(aa: x, bb: x), (y, y)] : [])
+  }
+}
+
+do {
+  struct S {
+    let a = 0.0
+    let b = 0.0
+    let c = 0.0
+    let d = 0.0
+
+    var customMirror: Mirror {
+      Mirror(self, children: [("a", a), ("b", b), ("c", c), ("d", d)],
+             displayStyle: .struct,
+             ancestorRepresentation: .suppressed)
+    }
+  }
+}
+
+do {
+  func padded(_: [(before: Int, after: Int)]) {}
+
+  func forward(size: (left: Int, right: Int)) {
+    padded([(0, 0), (0, 0), size])
+  }
+}
+
+// Tests for a special form of inference where we have both a
+// subtype and a supertype binding for a type variable, and the
+// subtype binding contains a type variable but the supertype
+// does not. We propagate the more concrete type from the
+// supertype binding to the subtype binding in this case.
+//
+// See BindingSet::addBinding() for details.
+
+// FIXME: This needs more tests.
+
+do {
+  func f<R>(fn: () -> [R]) -> [R] { [] }
+
+  // Requires collection upcast from Array<(key: String, value: String)> to `Array<(String, String)>`
+  func g(v: [String: String]) {
+    let _: [(String, String)] = f { return Array(v) } + v
+    let _: [(String, String)] = v + f { return Array(v) }
+    let _: [(String, String)] = f { return Array(v) } + Array(v)
+    let _: [(String, String)] = Array(v) + f { return Array(v) }
+    let _: [(String, String)] = v + Array(v)
+    let _: [(String, String)] = Array(v) + v
+    let _: [(String, String)] = Array(v) + Array(v)
+  }
+}
+
+protocol P {}
+
+extension String: P {}
+extension Int: P {}
+extension Optional: P where Wrapped: P {}
+
+do {
+  class C {
+    var string = ""
+    var integer = 0
+    var data = Data()
+    var optData: Data? = nil
+    var optOptData: Data?? = nil
+    var dictionary: [AnyHashable: Any]? = nil
+
+    static func _data(_: [AnyHashable: Any]?) -> Data {
+      return Data()
+    }
+
+    static func _optData(_: [AnyHashable: Any]?) -> Data? {
+      return nil
+    }
+  }
+
+  struct Data: P {}
+
+  func f1<T: Collection, U: Collection>(_: T)
+    where T.Element == U, U.Element == any P {}
+
+  func test1(_ elts: [C]) {
+    f1(elts.map { c in [c.string] })
+
+    f1(elts.map { c in [c.string, c.integer] })
+
+    f1(elts.map { c in [c.string, c.integer, c.data] })
+
+    f1(elts.map { c in [c.string, c.integer, c.optData] })
+
+    f1(elts.map { c in [c.string, c.integer, c.optOptData] })
+
+    f1(elts.map { c in [c.string, c.integer, c.data, c.optData] })
+
+    f1(elts.map { c in [c.string, c.integer, c.data, c.optData, c.optOptData] })
+
+    f1(elts.map { c in [c.string, c.integer, c.dictionary.map { C._data($0) }] })
+
+    f1(elts.map { c in [c.string, c.integer, c.dictionary.map { C._optData($0) }] })
+  }
+
+  struct Literal: ExpressibleByStringInterpolation {
+    init(stringInterpolation: Interpolation) {}
+    init(stringLiteral: String) {}
+
+    struct Interpolation: StringInterpolationProtocol {
+      typealias StringLiteralType = String
+
+      init(literalCapacity: Int, interpolationCount: Int) {}
+
+      func appendLiteral(_: String) {}
+      func appendInterpolation<T: Collection, U: Collection>(_: T)
+        where T.Element == U, U.Element == any P {}
+    }
+  }
+
+  func f2(_: Literal) {}
+
+  func test2(_ elts: [C]) {
+    f2("\(elts.map { c in [c.string] })")
+
+    f2("\(elts.map { c in [c.string, c.integer] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.data] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.optData] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.optOptData ] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.data, c.optData] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.data, c.optData, c.optOptData] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.dictionary.map { C._data($0) }] })")
+
+    f2("\(elts.map { c in [c.string, c.integer, c.dictionary.map { C._optData($0) }] })")
+  }
+}
+
+do {
+  class Super {}
+  class First<T>: Super {}
+  class Second: Super {}
+
+  func f0() -> [(String, () -> Super)] {
+    return [
+      ("", { return First<Int>() }),
+      ("", { return First<Bool>() }),
+      ("", { return Second() })
+    ]
+  }
+
+
+  func f1() -> [(String, () -> Super)] {
+    let result = [
+      ("", { return First<Int>() }),
+      ("", { return First<Bool>() }),
+      ("", { return Second() })
+    ]
+    return result
+  }
+
+  func f2() -> [(String, () -> Super)] {
+    return [
+      ("", {
+        let result = First<Int>()
+        return result
+      }),
+      ("", {
+        let result = First<Bool>()
+        return result
+      }),
+      ("", {
+        let result = Second()
+        return result
+      })
+    ]
+  }
+
+  func f3() -> [(String, () -> Super)] {
+    let result = [
+      ("", {
+        let result = First<Int>()
+        return result
+      }),
+      ("", {
+        let result = First<Bool>()
+        return result
+      }),
+      ("", {
+        let result = Second()
+        return result
+      })
+    ]
+    return result
+  }
+}
+
+// https://github.com/swiftlang/swift/issues/77003
+do {
+  struct Task<E> {
+    init(_: () -> ()) where E == Never {}
+    init(_: () throws -> ()) where E == Error {}
+  }
+
+  func f0<T, U>(_: T.Type, _ fn: (T) -> U, _: (U) -> ()) {}
+
+  func f1<T, U>(_: T.Type, _ fn: (T) -> U?, _: (U) -> ()) {}
+
+  func g1(x: Int?.Type) {
+      f0(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+      f1(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+  }
+
+  func f2<T, U>(_: T.Type, _ fn: (T) -> (U, U), _: (U) -> ()) {}
+
+  func g2(x: (Int, Int).Type) {
+      f0(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+      f2(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+  }
+
+  func f3<T, U>(_: T.Type, _ fn: (T) -> [U], _: (U) -> ()) {}
+
+  func g3(x: [Int].Type) {
+      f0(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+      f3(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+  }
+
+  func f4<T, U>(_: T.Type, _ fn: (T) -> [U?], _: (U) -> ()) {}
+
+  func g4(x: [Int?].Type) {
+      f0(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+      f4(x, { $0 }, { _ in Task {} })  // expected-warning {{result of 'Task<E>' initializer is unused}}
+  }
+}
+
+// Regression tests for closure returns defaulting to Void.
+// Here, we want to make sure that we don't diagnose ambiguity
+// because there are two places where we can convert to Void
+// here; in the outermost closure passed to g(), or the closure
+// passed to f().
+do {
+  @discardableResult
+  func f<T>(_: () -> T) -> T { fatalError() }
+
+  func g<T>(_: T, _: (T) -> ()) {}
+
+  struct R {
+    func m() -> Bool { fatalError() }
+  }
+
+  func h(r: R) {
+    g(r) { r in
+      f {
+        r.m()
+      }
+    }
+  }
+}
+
+// More elaborate variant of the above.
+do {
+  @discardableResult
+  func f<T>(_: () -> T) -> T { fatalError() }
+
+  @discardableResult
+  func f<T>(_: () async -> T) async -> T { fatalError() }
+
+  protocol P {}
+
+  struct R: P {
+    @discardableResult func g() async -> String {
+       fatalError()
+    }
+  }
+
+  class C {
+    func g<T: P>(_: T, _: (T) async -> ()) {}
+
+    func h(r: R) {
+      g(r) { r in
+        await f {
+          await r.g()
+        }
+      }
+    }
+  }
+}
+
+// rdar://problem/30271695
+do {
+  let x = "hi"
+  _ = [x].compactMap { $0.isEmpty ? nil : $0 }
+  _ = ["hi"].compactMap { $0.isEmpty ? nil : $0 }
+}
+
+// Generic argument matches involving 'any Sendable' are special-cased to
+// allow matching against 'Any' for backward compatibility with preconcurrency
+// code. Make sure this does the right thing here.
+do {
+  class G<T> {
+    init(_ t: T) {}
+  }
+
+  struct S {}  // note: not Sendable, but that's OK, we're in Swift 5 mode
+
+  let _: G<any Sendable> = G(S())
+}

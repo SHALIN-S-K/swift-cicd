@@ -1,0 +1,1744 @@
+//===--- LifetimeResolution.swift -----------------------------------------==//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
+import AST
+import SIL
+
+private func log(_ message: @autoclosure () -> String) {
+  llvmDebug("lifetime-resolution", message())
+}
+
+let lifetimeResolutionPass = FunctionPass(name: "lifetime-resolution") {
+  (function: Function, context: FunctionPassContext) in
+
+  guard function.hasOwnership else { return }
+
+  log("\n\n\n*** Starting LifetimeResolution on \(function.name.string)")
+
+  var resolver = Resolver(function, context)
+  var indexCache = FieldIndexTrieCache(for: function)
+
+  // Process results in reverse post-order to ensure dependent uses are already resolved.
+  for block in function.blocks.reversed() {
+    for inst in block.instructions.reversed() {
+      // Ignore `mark_uninitialized` this pass is driven by the storage itself.
+      if inst is MarkUninitializedInst { continue }
+
+      for result in inst.results {
+        resolver.resolve(result, &indexCache)
+      }
+    }
+    for argument in block.arguments {
+      resolver.resolve(argument, &indexCache)
+    }
+  }
+}
+
+extension Resolver {
+  mutating func resolve(_ root: Value, _ indexCache: inout FieldIndexTrieCache) {
+    if run(on: root, &indexCache) {
+      return
+    }
+
+    // TODO: Eventually we should analyze and resolve trivial, non-address values
+    //       in the same manner that we do for single-def values.
+    if root.type.isTrivial(in: root.parentFunction) {
+      return
+    }
+
+    // TODO: resolve `.guaranteed` values too. It should amount to having all consuming uses
+    //   require a copy, including those on the boundary, and inserting end_access/end_borrow.
+    if root.ownership == .owned {
+      resolveSingleDef(root, context)
+    }
+  }
+}
+
+
+/// Identifies a resolvable storage root.
+struct ResolvableRoot {
+  let storage: Value
+
+  /// The address that all accesses project from: the `mark_uninitialized` itself for
+  /// an `alloc_stack`, or the `project_box` for an `alloc_box`.
+  let address: Value
+
+  /// The source variable, for diagnostics.
+  let varDecl: VarDecl?
+
+  /// Whether the binding is a `let` (vs a `var`). Selects the diagnostic wording.
+  let isLet: Bool
+
+  let isLexical: Bool
+
+  // Does this address start fully initialized?
+  let startsInitialized: Bool
+
+  // Extra instructions to consider as full liveness uses of this root, that are not captured by walking uses of
+  // the address.
+  let extraLivenessUses: [Instruction]
+
+  // Either the instruction defining this root, or the very first instruction
+  // after which it is defined.
+  var startInstruction: Instruction {
+      if let inst = address.definingInstruction {
+          return inst
+      }
+      return address.nextInstruction
+  }
+
+  /// Build from a storage allocation (`alloc_box` / `alloc_stack`). Callers holding only
+  /// an address must first walk up to the allocation.
+  init?(_ val: Value, _ indexCache: inout FieldIndexTrieCache, _ context: FunctionPassContext) {
+    let function = val.parentFunction
+    var extraUses: [Instruction] = []
+
+    switch val {
+    case let allocStack as AllocStackInst:
+      storage = val
+
+      if let mu = Self.findMarkUninitialized(storage) {
+        address = mu
+
+        let indicies = indexCache.fieldIndices(for: storage.type.objectType)
+
+        // If this is the 'self' for an empty type in its initializer, we don't have any fields to initialize.
+        // So, treat the storage as being born initialized
+        startsInitialized = mu.kind == .rootSelf && !indicies.hasFields
+
+      } else {
+        address = storage
+        startsInitialized = false
+      }
+
+      varDecl = allocStack.varDecl
+      isLet = allocStack.debugVariable?.isLet() ?? true   // TODO: find a more reliable way to discover this.
+      isLexical = allocStack.isLexical
+
+    case let allocBox as AllocBoxInst:
+      storage = allocBox
+      guard let (projectBox, boxIsLexical) = Self.findProjectBox(of: allocBox) else {
+        return nil
+      }
+      address = projectBox
+      varDecl = allocBox.varDecl
+      isLet = !allocBox.type.getBoxFields(in: function).isMutable(fieldIndex: 0)
+      isLexical = boxIsLexical
+      startsInitialized = false
+
+      // Treat any lifetime ends or copies of the box itself as extra uses.
+      let box: Value
+      if let mu = Self.findMarkUninitialized(storage) {
+        box = mu
+      } else {
+        box = storage
+      }
+      box.uses.endingLifetime.forEach { extraUses.append($0.instruction) }
+      // TODO: add copies of the box too
+
+
+    case let arg as FunctionArgument where arg.type.isAddress:
+      storage = arg
+      address = arg
+      varDecl = arg.findVarDecl()
+      isLexical = arg.isLexical
+      isLet = false
+
+      switch arg.convention {
+      case .indirectIn:
+        startsInitialized = true
+      case .indirectOut:
+        startsInitialized = false
+      case .indirectInout:
+        startsInitialized = true
+
+        // For an inout parameter, all function exit terminators are considered uses.
+        function.exitingBlocks.forEach { extraUses.append($0.terminator) }
+
+
+      default:
+        return nil   // unimplemented convention
+      }
+
+      break
+    default:
+      return nil
+    }
+
+    extraLivenessUses = extraUses
+  }
+
+  // Change the storage such that it indicates a dynamic lifetime.
+  func convertToDynamic(_ context: MutatingContext) {
+    if let allocStack = storage as? AllocStackInst {
+      allocStack.setDynamicLifetime(context)
+    }
+    if let allocBox = storage as? AllocBoxInst {
+      allocBox.setDynamicLifetime(context)
+    }
+  }
+
+  /// Find the sole project_box reachable from an alloc_box from SILGen.
+  private static func findProjectBox(of boxValue: Value) -> (projectBox: ProjectBoxInst, isLexical: Bool)? {
+    for use in boxValue.uses {
+      switch use.instruction {
+      case let projectBox as ProjectBoxInst:
+        return (projectBox, false)
+      case let beginBorrow as BeginBorrowInst:
+        if let (projectBox, isLexical) = findProjectBox(of: beginBorrow) {
+          return (projectBox, isLexical || beginBorrow.isLexical)
+        }
+      case let markUninit as MarkUninitializedInst:
+        if let result = findProjectBox(of: markUninit) {
+          return result
+        }
+      default:
+        break
+      }
+    }
+    return nil
+  }
+
+  // A stack-backed local `let` or `var`; its `mark_uninitialized [var]` is the address.
+  private static func findMarkUninitialized(_ value: Value) -> MarkUninitializedInst? {
+    if let mu = value.uses.singleUser(ofType: MarkUninitializedInst.self) {
+      return mu
+    }
+    return nil
+  }
+}
+
+private struct Resolver {
+  let context: FunctionPassContext
+  let function: Function
+
+  typealias BlockState = Dictionary<BasicBlock, BlockInfo>
+  var state: BlockState
+
+  init(_ function: Function, _ context: FunctionPassContext) {
+    self.context = context
+    self.function = function
+    self.state = [:]
+  }
+
+  mutating func reset() {
+    // TODO: avoid reallocation by just resetting the BlockInfo's themselves.
+    self.state = [:]
+  }
+
+  // - Returns: true iff legalization was successful
+  mutating func run(on value: Value, _ indexCache: inout FieldIndexTrieCache) -> Bool {
+    guard let root = ResolvableRoot(value, &indexCache, context) else {
+      return false
+    }
+
+    log("\nResolver.run(on: \(value))")
+    reset()
+
+    ////////////////
+    // Step 1: Canonicalize copies/takes.
+    //
+    // This step comes before availability analysis, because we must know whether a `load`
+    // is a take or not before we can determine what memory locations must be destroyed, etc.
+
+    log("\n** Demand Analysis start **")
+
+    let type = root.address.type
+    let indices = indexCache.fieldIndices(for: type)
+    log("FieldIndexTrie of \(type): \n\(indices)")
+
+    self.state = Self.createBlockState(root, indices)
+
+    // Initialize the demand per block
+    for blk in function.blocks {
+      state[blk]!.initialDemand()
+    }
+
+    logState("\n** state before solveDemand **")
+    solveDemand(indices)
+
+    logState("\n** state before legalizeDemand **")
+    legalizeDemand(for: root, indices)
+
+    ////////////////
+    // Step 2: Determine availability at lifetime ends, handling partially initialized destroys.
+
+    logState("\n** state before initializing availability **")
+    for blk in function.blocks {
+      state[blk]!.initialAvailability()
+    }
+
+    logState("\n** state before solveAvailability **")
+    solveAvailability(indices)
+
+    logState("\n** state before legalizeAvailability **")
+    legalizeAvailability(root, indices)
+
+    logState("\n** final state **")
+
+    log("\n** Demand Analysis Phase finished **")
+    return true
+  }
+
+  func logState(_ header: String? = nil) {
+    if let header {
+      log(header)
+    }
+    for blk in function.blocks {
+      guard let info = state[blk] else {
+        log("\n!! no info for bb\(blk.index)")
+        continue
+      }
+      log("**bb\(blk.index)**\n\(info)")
+    }
+  }
+
+  // Solve the backward demand-flow to a fixpoint.
+  mutating func solveDemand(_ indices: FieldIndexTrie) {
+    var worklist = BasicBlockWorklist(context)
+    defer { worklist.deinitialize() }
+
+    // Seed with every block.
+    worklist.pushIfNotVisited(contentsOf: function.blocks)
+
+    // Use popAndForget so a block can be re-enqueued when one of
+    // its successors changes later; required to reach a fixpoint across loops.
+    while let block = worklist.popAndForget() {
+      guard let info = state[block] else { fatalError("no block state?") }
+
+      var exits = Array.init(repeating: Demand.nothing, count: indices.leafCount)
+      let range = info.demand.indices
+      assert(exits.count == range.upperBound)
+
+      // exit[i] = ⨆ over successors of the demand they place on field i
+      for succ in block.successors {
+        if let succInfo = state[succ] {
+          for i in range {
+            exits[i].formUnion(succInfo.demand[i].entry)
+          }
+        }
+      }
+
+      // entry[i] = gen[i] ∪ (exit[i] \ kill[i])
+      for i in range {
+        var demand = info.demand[i]
+        let exit = exits[i]
+
+        var entry = exit
+        entry.subtract(demand.kill)
+        entry.formUnion(demand.gen)
+
+        guard entry != demand.entry || exit != demand.exit else {
+          continue
+        }
+
+        // This block's demand changed. Update it and process its predecessors.
+        demand.exit = exit
+        demand.entry = entry
+        state[block]!.demand[i] = demand
+        worklist.pushIfNotVisited(contentsOf: block.predecessors)
+      }
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Legalization
+  //===--------------------------------------------------------------------===//
+
+  // Legalize the SIL from the solved demand, leaving markers behind for LifetimeResolutionDiagnose
+  // to turn into user-facing diagnostics for any misuses that were corrected by this phase.
+  mutating func legalizeDemand(for root: ResolvableRoot, _ indices: FieldIndexTrie) {
+    for block in function.blocks {
+      guard var events = state[block]?.events else { continue }
+      defer { state[block]!.events = events }
+
+      // Tracks the demand between individual uses within this block as we walk bottom-up.
+      // Initialized to the demand starting at the block's exit.
+      var current = state[block]!.demand.map { $0.exit }
+
+      for i in events.list.indices.reversed() {
+        legalize(event: &events.list[i], successorDemand: &current, root, indices)
+      }
+    }
+  }
+
+  // Legalize a single event with respect to the demand reaching it from its successor instruction.
+  func legalize(event: inout EventList.Event, successorDemand current: inout [Demand], _ root: ResolvableRoot,
+                _ indices: FieldIndexTrie) {
+    let noDemand = current[event.range].allSatisfy { $0 == .nothing }
+    let someDemand = !noDemand
+
+    let kind = event.kind
+    var newKind: EventList.Kind = kind
+
+    switch kind {
+    case .take where someDemand:
+      // A consume with demand still below it (use-after-consume): legalize with a copy.
+      newKind = transform(kind, to: .load(.copy), root.isLexical)
+
+    case .use(_, .own) where someDemand:
+      // A use demanding ownership, where there is some demand following it, can only be satisfied with a copy.
+      newKind = transform(kind, to: .load(.copy), root.isLexical)
+
+    case .use(_, .own) where noDemand:
+      // Canonicalize it into a take, as this is the last use.
+      newKind = transform(kind, to: .load(.take), root.isLexical)
+
+    case .use(_, .borrow) where someDemand:
+      // A noncopyable type forces a load_borrow here, since there's demand for the memory
+      // after this use no matter what nested accesses we may be nested within.
+      if root.address.type.objectType.isMoveOnly {
+        newKind = transform(kind, to: .loadBorrow, root.isLexical)
+        break
+      }
+
+    // TODO: for Copyable types, we should have a conservative check to see if we're in a nested mutating access
+    //       for this memory. If not, then it's proven safe to transform into a load_borrow (rdar://186687340)
+
+
+    case .use(_, .borrow) where noDemand:
+      // No users need ownership of the value, and there is no demand after this use.
+      // We could either take or borrow; either way, we should avoid a copy if possible.
+      // TODO: If ownership originally was guaranteed, yet we're choosing to do a take,
+      //          we'd need to insert destroy_value's on non-consuming paths. It's probably hard to
+      //          emit a load_borrow for a copyable type, given access scopes may end.
+      newKind = transform(kind, to: .load(.take), root.isLexical)
+
+    case let .root(r) where someDemand && !r.startsInitialized:
+      // Unsatisfied demand reaching the root means there exists a use-before-init of those leaves.
+      let demanded = event.range.filter { current[$0] != .nothing }
+      initializeWithUndef(leaves: demanded, of: root, indices)
+
+    default:
+      break
+    }
+
+    // Update the kind, in case we did a transform.
+    event.kind = newKind
+
+    // Compose this use's transfer to get the demand above it.
+    current[event.range].mutatingEach {
+      $0.subtract(event.kind.kills)
+      $0.formUnion(event.kind.gens)
+    }
+  }
+
+  enum TransformRequest: CustomStringConvertible {
+    case load(LoadInst.LoadOwnership)
+    case loadBorrow
+
+    var description: String {
+      switch self {
+      case let .load(kind): return "\(kind)"
+      case .loadBorrow: return "borrow"
+      }
+    }
+  }
+
+  func transform(_ kind: EventList.Kind, to request: TransformRequest, _ isLexical: Bool) -> EventList.Kind {
+    log("requested transform \(isLexical ? "(lexical) " : "")to \(request), given \(kind))")
+
+    let newOp: Operand
+    let newDem: Demand
+    switch kind {
+    case let .use(op, dem):
+      newOp = transformOperand(op, to: request, wasTake: false, isLexical)
+      newDem = dem
+    case let .take(op, dem):
+      newOp = transformOperand(op, to: request, wasTake: true, isLexical)
+      newDem = dem
+    default:
+      fatalError("unexpected event kind to transform: \(kind)")
+    }
+
+    // Reclassify the event based on the transform request.
+    if case .load(.take) = request {
+      return .take(newOp, newDem)
+    }
+    return .use(newOp, newDem)
+  }
+
+  // Performs the requested transformation.
+  // If we're turning a take into a copy, or copying a noncopyable type, we add a `diagnose` instruction.
+  func transformOperand(_ op: Operand, to request: TransformRequest, wasTake: Bool, _ isLexical: Bool) -> Operand {
+    switch op.instruction {
+    case let apply as FullApplySite:
+      // We can only handle transform that provides a copy to the apply.
+      guard case .load(.copy) = request, wasTake else {
+        fatalError("cannot satisfy transform to \(request) for apply operand \(op.index) of \(apply)")
+      }
+
+      // Copy the value into a temporary alloc_stack and pass that to the apply, i.e,
+      //    %alloc = alloc_stack
+      //    copy_addr %op to [init] %alloc
+      //    diagnose %op [unpermitted_copy]  <-- only if it's move-only
+      //    apply(%alloc) : (@in) -> ...
+      //    dealloc_stack %alloc
+      let type = op.value.type.objectType
+      let allocBuilder = Builder(before: apply, context)
+      let alloc = allocBuilder.createAllocStack(type)
+      allocBuilder.createCopyAddr(from: op.value, to: alloc, takeSource: false, initializeDest: true)
+      if type.isMoveOnly {
+        allocBuilder.createDiagnose(operand: op.value, kind: .unpermittedCopy)
+      }
+      op.set(to: alloc, context)
+      Builder(after: apply, context).createDeallocStack(alloc)
+      return op
+
+    // copy_addr
+    case let copyAddr as CopyAddrInst:
+      assert(op.value == copyAddr.source, "only the source is being read!")
+
+      guard case let .load(newOwnership) = request else {
+        fatalError("unhandled transform of copy_addr to \(request)")
+      }
+
+      let becomesCopy = newOwnership != .take
+      copyAddr.set(isTakeOfSource: !becomesCopy, context)
+
+      if becomesCopy && (wasTake || copyAddr.type.isMoveOnly) {
+        Builder(after: copyAddr, context).createDiagnose(operand: op.value, kind: .unpermittedCopy)
+      }
+      return op
+
+    case let load as LoadInst:
+      switch request {
+      // load [old] --> load [new]
+      case let .load(newOwnership):
+        load.set(ownership: newOwnership, context)
+
+        if newOwnership == .copy && (wasTake || load.type.isMoveOnly) {
+          Builder(after: load, context).createDiagnose(operand: load, kind: .unpermittedCopy)
+        }
+        return load.operand
+
+      // load [old] --> load_borrow
+      case .loadBorrow:
+        // Place the new load_borrow right after this load.
+        let loadBorrow = Builder(after: load, context).createLoadBorrow(fromAddress: load.address)
+
+        // Build a live range of the current users of the load.
+        var loadUsers = PartitionedUses(of: load, context)
+        defer { loadUsers.deinitialize() }
+        loadUsers.partitionUses(withDeinitBarriers: isLexical)
+
+        assert(loadUsers.consumes.isEmpty,
+          "Can't transform load with these non-destroy consumers existing: \(loadUsers.consumes)")
+
+        var range = loadUsers.fullLiveRange()
+        defer { range.deinitialize() }
+
+        // Insert end_borrow's across the entire liveness boundary of the current load.
+
+        // TODO: this doesn't yet handle accesses that end early:
+        //      %a = begin_access [read]
+        //      %x = load [copy] %a
+        //      end_access %a
+        //      use %x
+        //  When introducing the load_borrow, we need to sink all outer access scopes of the address too!
+        range.alongBoundary(context) { builder in
+          builder.createEndBorrow(of: loadBorrow)
+        }
+
+        // Replace users of the load with the load_borrow, and then delete the load.
+        for use in load.uses {
+          if let destroy = use.instruction as? DestroyValueInst {
+            context.erase(instruction: destroy)
+            continue
+          }
+          use.set(to: loadBorrow, context)
+        }
+        context.erase(instruction: load)
+        return loadBorrow.operand
+      }
+    default:
+      fatalError("unexpected inst to transform: \(op.instruction)")
+    }
+  }
+
+  // Emit an `assign undef to [init]` of each given leaf of the root, right after the root's definition.
+  func initializeWithUndef(leaves: [Int], of root: ResolvableRoot, _ indices: FieldIndexTrie) {
+    let builder = Builder(after: root.startInstruction, context)
+    for leaf in leaves {
+      let address = indices.emitElementAddress(forLeaf: leaf, from: root.address, builder)
+      let undef = Undef.get(type: address.type.objectType, context)
+      builder.createAssign(source: undef, destination: address, ownership: .initialize)
+    }
+  }
+
+  // Forward dataflow solving for the availability of fields, to a fixed-point.
+  mutating func solveAvailability(_ indices: FieldIndexTrie) {
+    var worklist = BasicBlockWorklist(context)
+    defer { worklist.deinitialize() }
+
+    // Seed with every block.
+    worklist.pushIfNotVisited(contentsOf: function.blocks)
+
+    // Use popAndForget so a block can be re-enqueued when one of
+    // its predecessors changes later; required to reach a fixpoint across loops.
+    while let block = worklist.popAndForget() {
+      guard let info = state[block] else { fatalError("no block state?") }
+
+      var entries = Array.init(repeating: Availability.unknown, count: indices.leafCount)
+      let range = info.availability.indices
+      assert(entries.count == range.upperBound)
+
+      // entry[i] = ⨆ over predecessors of the availability they provide for field i
+      for pred in block.predecessors {
+        if let predInfo = state[pred] {
+          for i in range {
+            entries[i].formUnion(predInfo.availability[i].exit)
+          }
+        }
+      }
+
+      // exit[i] = gen[i] ∪ (entry[i] \ kill[i])
+      for i in range {
+        var avail = info.availability[i]
+        let entry = entries[i]
+
+        var exit = entry
+        exit.subtract(avail.kill)
+        exit.formUnion(avail.gen)
+
+        guard entry != avail.entry || exit != avail.exit else {
+          continue
+        }
+
+        // This block's availability changed. Update it and process its successors.
+        avail.entry = entry
+        avail.exit = exit
+        state[block]!.availability[i] = avail
+        worklist.pushIfNotVisited(contentsOf: block.successors)
+      }
+    }
+  }
+
+  mutating func legalizeAvailability(_ root: ResolvableRoot, _ indices: FieldIndexTrie) {
+    typealias PartialAvailability = (inst: Instruction, avail: [Availability], range: FieldIndexTrie.IndexRange)
+    var partialDestroys: [PartialAvailability] = []
+    var destroysBeforeInit: [PartialAvailability] = []
+
+    // Do a first pass over blocks, collecting any needed partial destroys for a second step.
+    for block in function.blocks {
+      guard var events = state[block]?.events else { continue }
+
+      // Tracks the availability between individual events within this block as we walk top-down.
+      // Initialized to the availability at the block's entry.
+      var current = state[block]!.availability.map { $0.entry }
+
+      // - Returns true iff this event's instruction was deleted.
+      func legalize(kind: EventList.Kind, range: EventList.IndexRange) -> Bool {
+        // Log the computed availability for now.
+        let fields = current[range].enumerated()
+                .map { "\(range.lowerBound + $0.offset)=\($0.element)" }
+                .joined(separator: " ")
+        log("availability at [\(fields)] | \(kind.inst)")
+
+        let summary = current[range].reduce(Availability.unknown, { $0.union($1) })
+
+        var didDelete = false
+
+        switch kind {
+        case let .def(op):
+          let nontrivial = range.filter { !indices.leafType($0).isTrivial(in: function) }
+          if nontrivial.isEmpty {
+            break
+          }
+          let defSummary = nontrivial.reduce(Availability.unknown, { $0.union(current[$1]) })
+          assert(defSummary != .unknown, "missing information!")
+
+          switch defSummary {
+          case .no:
+            makeDef(op.instruction, initialization: true)
+          case .yes:
+            if !makeDef(op.instruction, initialization: false) {
+              destroysBeforeInit.append((op.instruction, current, range))
+            }
+          default:
+            // Only some fields are available, so destroy those first to make this a full initialization.
+            destroysBeforeInit.append((op.instruction, current, range))
+            makeDef(op.instruction, initialization: true)
+          }
+        case let .end(op):
+          assert(summary != .unknown, "missing information!")
+
+          // If fully available, this lifetime ending instruction can stay as-is.
+          if summary == .yes {
+            break
+          }
+
+          // If completely unavailable (consumed), it's lifetime ended earlier, so delete this one.
+          if summary == .no {
+            context.erase(instruction: op.instruction)
+            didDelete = true
+            break
+          }
+
+          // Otherwise, it's partially available. It will be replaced with partial destroys later.
+          partialDestroys.append((op.instruction, current, range))
+          didDelete = true
+
+        default:
+          break
+        }
+
+        // Compose this event's forward transfer to get the availability below it.
+        current[range].mutatingEach {
+          $0.subtract(kind.availKill)
+          $0.formUnion(kind.availGen)
+        }
+
+        return didDelete
+      }
+
+      // Process the events for this block, removing any that must be dropped.
+      events.list.removeAll(where: legalize)
+      state[block]!.events = events
+    }
+
+    // Step 2: insert partial destroys where needed.
+    if partialDestroys.isEmpty && destroysBeforeInit.isEmpty {
+      return
+    }
+
+    // Only fields that are conditionally initialized where they must be destroyed need a runtime test.
+    var conditionalLeaves = Set<Int>()
+    for (_, avail, range) in partialDestroys + destroysBeforeInit {
+      conditionalLeaves.formUnion(range.filter { avail[$0] == .partial })
+    }
+
+    var controlVar: ControlVariable? = nil
+    if !conditionalLeaves.isEmpty {
+      controlVar = ControlVariable(for: root, numBits: indices.leafCount, context)
+    }
+
+    for (destroy, avail, range) in partialDestroys {
+      destroyAvailableFields(avail, range, before: destroy, root, indices, controlVar)
+
+      // Everything in range is now uninitialized.
+      controlVar?.update(range, initialized: false, before: destroy)
+      context.erase(instruction: destroy)
+    }
+
+    for (def, avail, range) in destroysBeforeInit {
+      destroyAvailableFields(avail, range, before: def, root, indices, controlVar)
+    }
+
+    if let controlVar {
+      trackControlVariable(controlVar, conditionalLeaves)
+      root.convertToDynamic(context)
+    }
+  }
+
+  // Converts a def into an initialization or assignment of its destination.
+  // - Returns false iff the def cannot be expressed as an assignment.
+  @discardableResult
+  func makeDef(_ inst: Instruction, initialization: Bool) -> Bool {
+    switch inst {
+    case let store as StoreInst:
+      if store.storeOwnership != .trivial {
+        store.set(ownership: initialization ? .initialize : .assign, context)
+      }
+    case let assign as AssignInst:
+      // TODO: handle `[reinit]` once class initializers are supported.
+      if assign.assignOwnership != .reinitialize {
+        assign.set(ownership: initialization ? .initialize : .reassign, context)
+      }
+    case let copyAddr as CopyAddrInst:
+      copyAddr.set(isInitializationOfDestination: initialization, context)
+    case let tupleAddrConstructor as TupleAddrConstructorInst:
+      tupleAddrConstructor.set(isInitializationOfDestination: initialization, context)
+    case is FullApplySite:
+      return initialization
+    default:
+      // TODO: handle assign_or_init, store_weak, store_unowned, etc.
+      log("unhandled def: \(inst)")
+    }
+    return true
+  }
+
+  // Keep the control variable's bits in sync with the availability of the fields at each event.
+  // This must happen after any partial destroys are inserted, so a def's bits are only set after
+  // the fields it overwrites have been tested.
+  func trackControlVariable(_ controlVar: ControlVariable, _ conditionalLeaves: Set<Int>) {
+    for block in function.blocks {
+      guard let events = state[block]?.events else { continue }
+
+      for (kind, range) in events.list where range.contains(where: conditionalLeaves.contains) {
+        switch kind {
+        case .def:
+          controlVar.update(range, initialized: true, before: kind.inst)
+        case .take, .end:
+          controlVar.update(range, initialized: false, before: kind.inst)
+        case .root:
+          break  // Initialized upon creation.
+        case .use, .unknown:
+          break
+        }
+      }
+    }
+  }
+
+  // Destroys only the available fields of partially available memory, testing the control variable
+  // for fields that are only conditionally available.
+  func destroyAvailableFields(_ current: [Availability], _ range: EventList.IndexRange, before inst: Instruction,
+                              _ root: ResolvableRoot, _ indices: FieldIndexTrie, _ controlVar: ControlVariable?) {
+    log("destroying available fields before \(inst)")
+
+    for leaf in range {
+      if current[leaf] == .no || indices.leafType(leaf).isTrivial(in: function) {
+        continue
+      }
+
+      if current[leaf] == .yes {
+        let builder = Builder(before: inst, context)
+        builder.createDestroyAddr(address: indices.emitElementAddress(forLeaf: leaf, from: root.address, builder))
+        continue
+      }
+
+      assert(current[leaf] == .partial)
+      guard let controlVar else { fatalError("missing control variable for conditional destroy") }
+
+      // Split the block into a diamond around the destroy of this field:
+      //
+      //   start:  cond_br (test bit), trueBlock, falseBlock
+      //   trueBlock:  destroy_addr field; br cont
+      //   falseBlock: br cont
+      //   cont:  <inst> ...
+      let condition = controlVar.test(leaf, before: inst)
+      let start = inst.parentBlock
+      let cont = context.splitBlock(before: inst)
+      let trueBlock = context.createBlock(after: start)
+      let falseBlock = context.createBlock(after: trueBlock)
+
+      let trueBuilder = Builder(atEndOf: trueBlock, location: inst.location, context)
+      trueBuilder.createDestroyAddr(address: indices.emitElementAddress(forLeaf: leaf, from: root.address, trueBuilder))
+      trueBuilder.createBranch(to: cont)
+
+      Builder(atEndOf: falseBlock, location: inst.location, context).createBranch(to: cont)
+      Builder(atEndOf: start, location: inst.location, context)
+        .createCondBranch(condition: condition, trueBlock: trueBlock, falseBlock: falseBlock)
+    }
+  }
+
+  // FIXME: a LifetimeDependenceDefUseWalker would be better to use here.
+  private struct UseCollector : AddressDefUseWalker {
+    private(set) var uses: Dictionary<BasicBlock, EventList> = [:]
+    private let indices: FieldIndexTrie
+
+    init(_ indices: FieldIndexTrie) { self.indices = indices }
+
+    mutating func addUse(_ k:  EventList.Kind, _ range: EventList.IndexRange) {
+      log("\taddUse of \(range) as \(k)")
+      let blk = k.inst.parentBlock
+      uses[blk, default: EventList(blk)].add(k, range)
+    }
+
+    mutating func collectUses(of root: ResolvableRoot) -> Bool {
+      let address = root.address
+      log("** starting collectUses on \(address) **")
+
+      // Add the root use to do detect uninitialized paths.
+      addUse(.root(root), indices.wholeRange)
+
+      if walkDownUses(ofAddress: address, path: Path()) == .abortWalk {
+        return false
+      }
+
+      // Add any extra uses specific to this root.
+      root.extraLivenessUses.forEach { addUse(.unknown($0), indices.wholeRange) }
+
+      // Ensure correct order within each block
+      for blk in uses.keys {
+        uses[blk]?.finalize()
+      }
+
+      return true
+    }
+
+    mutating func leafUse(address: Operand, path: UnusedWalkingPath) -> WalkResult {
+      let ap = address.value.accessPath
+      let inst = address.instruction
+      let path = ap.projectionPath
+      let range = indices.range(of: path)
+      log("leafUse(\(path)) of \(range) in \t\(inst)")
+
+      // If the loaded SSA value is consumed by some non-destroying instruction, its demand is "own".
+      func hasConsumingUser(_ op: Operand) -> Bool {
+        return op.ownership == .forwardingConsume || op.instruction is MoveValueInst
+      }
+
+      switch inst {
+      case let load as LoadInst:
+        switch load.loadOwnership {
+        case .take:
+            addUse(.take(address, .own), range)   // TODO: what about a take where all non-destroy users borrow?
+        case .unqualified, .copy:
+          if load.uses.filter(hasConsumingUser).isEmpty {
+            addUse(.use(address, .borrow), range)
+          } else {
+            addUse(.use(address, .own), range)
+          }
+        case .trivial:
+          // We cannot meaningfully transform `load [trivial]` into a take or copy, as it currently has no ownership.
+          // Treat it as a generic use.
+          addUse(.unknown(load), range)
+        }
+      case let store as StoringInstruction where store.destination == address.value:
+        addUse(.def(address), range)
+
+      case let apply as FullApplySite:
+        switch apply.convention(of: address) {
+        case .indirectOut:
+          addUse(.def(address), range)
+        case .indirectIn:
+          addUse(.take(address, .own), range)
+        default:
+          addUse(.unknown(address.instruction), range)
+        }
+
+      case let tac as TupleAddrConstructorInst where tac.destinationOperand == address:
+        addUse(.def(address), range)
+
+      case let srcDestInst as SourceDestAddrInstruction:
+        if srcDestInst.destinationOperand == address {
+          addUse(.def(address), range)
+        } else if srcDestInst.isTakeOfSource {
+          addUse(.take(address, .own), range)
+        } else {
+          addUse(.use(address, .own), range)
+        }
+
+      case is DestroyAddrInst:
+        addUse(.end(address), range)
+      case is DeallocStackInst:
+        // skip
+        break
+      default:
+        addUse(.unknown(address.instruction), range)
+      }
+      return .continueWalk
+    }
+  }
+
+  static func createBlockState(_ root: ResolvableRoot, _ indices: FieldIndexTrie) -> BlockState {
+    var uc = UseCollector(indices)
+    guard uc.collectUses(of: root) else {
+      fatalError("collectUses aborted its walk?")
+    }
+
+    var state: BlockState = [:]
+
+    let emptyDemand = Array.init(repeating: BlockDemand(), count: indices.leafCount)
+    let emptyAvailability = Array.init(repeating: BlockAvailability(), count: indices.leafCount)
+
+    // Initialize an empty block state along with the accesses for that particular block.
+    // We need state for all blocks, so information transits across them.
+    let function = root.address.parentFunction
+    for block in function.blocks {
+      let uses = uc.uses[block]
+      state[block] = BlockInfo(emptyDemand, emptyAvailability, uses)
+    }
+
+    return state
+  }
+
+  // What kind of ownership is demanded by a successor instruction or block?
+  struct BlockDemand: CustomStringConvertible {
+    var entry: Demand = .nothing // What is the ownership demanded by this block of its predecessors?
+    var gen: Demand = .nothing   // What demand is generated within this block?
+    var kill: Demand = .nothing  // What demand is satisfied within this block?
+    var exit: Demand = .nothing  // What is the ownership demanded from this block by successors?
+
+    var description: String {
+      return "[entry: \(entry), gen: \(gen), kill: \(kill), exit: \(exit)]"
+    }
+  }
+
+  // What is the initialization state of a field within this block?
+  // The forward dual of BlockDemand: information flows from predecessors to successors.
+  struct BlockAvailability: CustomStringConvertible {
+    var entry: Availability = .unknown // Availability flowing in from predecessors.
+    var gen: Availability = .unknown   // Availability produced within this block (reaches exit).
+    var kill: Availability = .unknown  // Availability overwritten within this block.
+    var exit: Availability = .unknown  // Availability flowing out to successors.
+
+    var description: String {
+      return "[entry: \(entry), gen: \(gen), kill: \(kill), exit: \(exit)]"
+    }
+  }
+
+  /// Represents the state of ownership demanded during the backwards demand analysis.
+  ///        All
+  ///        / \
+  ///   Borrow  Own
+  ///        \ /
+  ///        Nothing
+  struct Demand: OptionSet, CustomStringConvertible {
+    let rawValue: UInt8
+
+    static let borrow = Demand(rawValue: 1 << 0)  // 0b01
+    static let own  = Demand(rawValue: 1 << 1)  // 0b10
+
+    static let nothing: Demand = []                // ⊥
+    static let all: Demand     = [.borrow, .own] // ⊤
+
+    var description: String {
+      switch self {
+      case .nothing: "∅"
+      case .borrow:  "β"
+      case .own:   "ω"
+      case .all:     "⊤"
+      default: fatalError("unknown bits: \(rawValue)")
+      }
+    }
+  }
+
+  /// Represents whether a field is initialized during the forward availability analysis.
+  ///       Partial
+  ///        / \
+  ///     Yes   No
+  ///        \ /
+  ///      Unknown
+  struct Availability: OptionSet, CustomStringConvertible {
+    let rawValue: UInt8
+
+    static let yes = Availability(rawValue: 1 << 0)  // 0b01 : definitely initialized
+    static let no  = Availability(rawValue: 1 << 1)  // 0b10 : definitely uninitialized
+
+    static let unknown: Availability = []          // ⊥
+    static let partial: Availability = [.yes, .no] // ⊤ : initialized on some paths, not others
+
+    var description: String {
+      switch self {
+      case .unknown: "?"
+      case .yes:     "✓"
+      case .no:      "✗"
+      case .partial: "⊤"
+      default: fatalError("unknown bits: \(rawValue)")
+      }
+    }
+  }
+
+  // Classified memory events within a BasicBlock.
+  struct EventList: CustomStringConvertible {
+    typealias IndexRange = FieldIndexTrie.IndexRange
+    typealias Event = (kind: Kind, range: IndexRange)
+
+    private let block: BasicBlock
+
+    var list: [Event] // All of the categorized uses within this block.
+    private(set) var finalized = false
+
+    init(_ blk: BasicBlock) {
+      self.block = blk
+      self.list = []
+    }
+
+    var description: String {
+      return list.map { "\($0.range.description) \($0.kind.description)" }
+              .joined(separator: "\n")
+    }
+
+    enum Kind: CustomStringConvertible {
+      case root(ResolvableRoot)
+      case use(Operand, Demand)         // The demand summarizes the kinds of users of this operand's instruction.
+      case take(Operand, Demand)        // The demand summarizes the kinds of users of this operand's instruction.
+      case def(Operand)
+      case end(Operand)       // An instruction representing the point at which the operand's lifetime has ended.
+      case unknown(Instruction)
+
+      var inst: Instruction {
+        switch self {
+        case let .root(r): r.startInstruction
+        case let .use(op, _): op.instruction
+        case let .take(op, _): op.instruction
+        case let .def(op): op.instruction
+        case let .end(op): op.instruction
+        case let .unknown(inst): inst
+        }
+      }
+
+      // What is the ownership demanded by this use?
+      var gens: Demand {
+        switch self {
+        case let .use(_, dem): dem
+        case let .take(_, dem): dem
+        case .def, .root: .nothing
+        case .end: .nothing  // Demand analysis ignores lifetime ends.
+        case .unknown: .all  // to be safe
+        }
+      }
+
+      // What ownership does this use satisfy?
+      var kills: Demand {
+        switch self {
+        case .def: .all
+        case let .root(r) where r.startsInitialized: .all // A root that starts initialized is a def.
+        default: .nothing
+        }
+      }
+
+      // What availability does this event establish? (forward analysis)
+      var availGen: Availability {
+        switch self {
+        case .def: .yes
+        case let .root(r) where r.startsInitialized: .yes  // A root that starts initialized is a def.
+        case .root, .take, .end: .no    // these leave the operand uninitialized.
+        case .use: .unknown       // doesn't change the state
+        case .unknown: .unknown   // TODO: conservatively handle once .unknown is removed
+        }
+      }
+
+      // What prior availability does this event overwrite?
+      var availKill: Availability {
+        switch self {
+        case .def, .root, .take, .end: .partial    // Overwites all availability.
+        case .use, .unknown: .unknown
+        }
+      }
+
+      var description: String {
+        let name: String =
+        switch self {
+        case let .use(_, dem): "use(\(dem))"
+        case let .take(_, dem): "take(\(dem))"
+        case .root: "root"
+        case .def: "def"
+        case .end: "end"
+        case .unknown: "UNKNOWN"
+        }
+
+        return name + " | \(inst)"
+      }
+    }
+
+    mutating func add(_ k: Kind, _ range: IndexRange) {
+      assert(k.inst.parentBlock == block)
+      list.append((kind: k, range: range))
+    }
+
+    // Ensure uses are in a faithful block-local order.
+    mutating func finalize() {
+      guard !finalized else { return }
+      list.sort(by: { $0.kind.inst.strictlyDominatesInBlock($1.kind.inst) })
+      finalized = true
+    }
+  }
+
+  struct BlockInfo: CustomStringConvertible {
+    var events: EventList?    // Uses appearing within this block, if any.
+    var demand: Array<BlockDemand>
+    var availability: Array<BlockAvailability>
+
+    init(_ demand: Array<BlockDemand>, _ avail: Array<BlockAvailability>, _ useList: EventList? = nil) {
+      assert(!demand.isEmpty)
+      if let provided = useList {
+        assert(!provided.list.isEmpty, "You should pass nil if there are no uses.")
+      }
+
+      self.events = useList
+      self.demand = demand
+      self.availability = avail
+    }
+
+    mutating func initialDemand() {
+      guard let events else { return }
+      assert(events.finalized, "AccessList needs to be finalized!")
+
+      // Scan backwards over the uses within this block to compute its 'gen' bits, so that entry = gen ∪ (exit \ kill).
+      for (use, range) in events.list.reversed() {
+        demand[range].mutatingEach {
+          $0.gen.subtract(use.kills)     // a def above wipes demand generated below it
+          $0.gen.formUnion(use.gens)     // this use's own demand survives to the top
+          $0.kill.formUnion(use.kills)
+          $0.entry = $0.gen
+        }
+      }
+    }
+
+    mutating func initialAvailability() {
+      guard let events else { return }
+      assert(events.finalized, "AccessList needs to be finalized!")
+
+      // Scan forwards so that exit = gen ∪ (entry \ kill).
+      for (event, range) in events.list {
+        availability[range].mutatingEach {
+          $0.gen.subtract(event.availKill)   // a def/take below overwrites what was produced above it
+          $0.gen.formUnion(event.availGen)   // this event's own availability survives to the bottom
+          $0.kill.formUnion(event.availKill)
+          $0.exit = $0.gen
+        }
+      }
+    }
+
+    var description: String {
+      return """
+             BlockInfo {
+             demand: {\n\(demand.enumerated().map { "\($0.offset) | \($0.element)" }.joined(separator: "\n"))\n}
+             availability: {\n\(availability.enumerated().map { "\($0.offset) | \($0.element)" }.joined(separator: "\n"))\n}
+             uses: {
+             \(events?.description ?? "nil")
+             }
+             }
+             """
+    }
+  }
+}
+
+// Static-single assignment values (SSA), aka objects in SIL, are defined exactly once, so we
+// use a simpler, cheaper analysis for such values instead of the storage-backed one above.
+private func resolveSingleDef(_ root: Value, _ context: FunctionPassContext) {
+  assert(!root.type.isAddress, "addresses are multi-def")
+  log("\n\nLifetimeResolution.resolveSingleDef(\(root))\n\n")
+
+  var uses = PartitionedUses(of: root, context)
+  defer { uses.deinitialize() }
+
+  // Step 0: Find and partition uses of the values.
+  let isLexical = root.isInLexicalLiverange(context)
+  uses.partitionUses(withDeinitBarriers: isLexical)
+
+  log(uses.description)
+
+  // If there are absolutely no liveness uses, there's nothing to do.
+  guard uses.haveLivenessUses() else {
+    // TODO: Eventually this pass should ensure a destroy is placed right after the def.
+    return
+  }
+
+  // Step 1: Resolve where copies are required to ensure there are no consumes before uses.
+  uses.insertCopies()
+
+  // Step 2: Insert destroys after non-consuming boundary users.
+  uses.fixupDestroys()
+}
+
+private struct PartitionedUses: CustomStringConvertible {
+  // The uses of this value that are partitioned.
+  let root: Value
+
+  let context: FunctionPassContext
+
+  // Lifetime delimiting instructions.
+  //
+  // These instructions represent the limits of permitted liveness for the value,
+  // if otherwise not consumed upon reaching the instruction.
+  // TODO: these should be some sort of new end_scope instruction that are used to limit how late
+  //  a destroy/end_access can be inserted.
+  var lifetimeLimits: Stack<DestroyValueInst>
+
+  // Uses that require ownership of the value (not guaranteed).
+  var consumes: Stack<Operand>
+
+  // These are indirect uses of the root, including deinit barriers and dependent uses.
+  var indirectUses: Stack<Instruction>
+
+  // Uses that otherwise do not fit into the other buckets.
+  var uses: Stack<Operand>
+
+  // Set when some use's contribution to liveness could not be bounded, so that liveness must be
+  // fully extended to lifetimeLimits, rather than hoisted above an unseen use.
+  var hasUnboundedUse = false
+
+  let localReachabilityCache = LocalVariableReachabilityCache()
+
+  init(of root: Value, _ context: FunctionPassContext) {
+    self.root = root
+    self.context = context
+    self.consumes = Stack(context)
+    self.lifetimeLimits = Stack(context)
+    self.uses = Stack(context)
+    self.indirectUses = Stack(context)
+  }
+
+  mutating func deinitialize() {
+    consumes.deinitialize()
+    lifetimeLimits.deinitialize()
+    uses.deinitialize()
+    indirectUses.deinitialize()
+  }
+
+  // After partitioning, are there any non-destroy uses?
+  func haveLivenessUses() -> Bool { !uses.isEmpty || !indirectUses.isEmpty || !consumes.isEmpty }
+
+  var description: String {
+    return """
+           PartitionedUses of: \(root)) [
+             uses = \(uses)
+             consumes = \(consumes)
+             indirectUses = \(indirectUses)
+             hasUnboundedUse = \(hasUnboundedUse)
+           ]
+           """
+  }
+
+  mutating func partitionUses(withDeinitBarriers addBarriers: Bool) {
+    // TODO: should we use an InteriorUseWalker or some other robust walker?
+    for use in root.uses {
+      switch (use.ownership) {
+      case .destroyingConsume:
+        fallthrough
+      case .forwardingConsume:
+        // Perhaps Operand.isScopeEndingUse or Operand.endsLifetime is also useful here?
+        if let destroy = use.instruction as? DestroyValueInst {
+          lifetimeLimits.append(destroy)
+          continue
+        }
+
+        consumes.append(use)
+
+      default:
+        collectUse(use)
+      }
+    }
+
+    // Only lexical roots need to include deinit barriers.
+    // TODO: study https://gist.github.com/atrick/cc03c4d07fb0a7bee92c223ae5e5695b and the current implementation
+    //   to tailor destroy insertion correctly for non-copyable types.
+    if addBarriers {
+      addDeinitBarriers(of: root)
+    }
+  }
+
+  // A use that opens a scope keeps the value live until that scope closes, so record the
+  // scope-ending uses in its place: they post-dominate the opening use, so they alone
+  // delimit the liveness it contributes.
+  private mutating func collectUse(_ use: Operand) {
+    let borrowInst = BorrowingInstruction(use.instruction)
+    if let borrowInst = borrowInst,
+       collectScopeEnds(of: borrowInst) {
+      return
+    }
+
+    uses.append(use)
+
+    if let markDep = use.instruction as? MarkDependenceInstruction,
+       use == markDep.baseOperand {
+      collectDependentUses(of: markDep)
+    } else if borrowInst != nil {
+      // The scope can't be determined from lifetime-ending uses and isn't a dependence we can
+      // walk, so liveness past this use is unknown.
+      hasUnboundedUse = true
+    }
+  }
+
+  // Records the instructions closing borrowInst's scope. Returns true if we were able to find
+  // all scope ends. Otherwise, there may be escaping dependency or unhandled mark_dependence.
+  private mutating func collectScopeEnds(of borrowInst: BorrowingInstruction) -> Bool {
+    // TODO: remove this stack by changing visitScopeEndingOperands to take a non-escaping
+    // closure, as visitInnerBorrowUses also wants.
+    var ends = Stack<Instruction>(context)
+    defer { ends.deinitialize() }
+    let result = borrowInst.visitScopeEndingOperands(context) {
+      ends.push($0.instruction)
+      return .continueWalk
+    }
+    guard result == .continueWalk else {
+      return false
+    }
+    indirectUses.append(contentsOf: ends)
+    return true
+  }
+
+  // The value depending on `markDep` keeps the root alive through its own uses, which are not
+  // uses of the root. Record them so that liveness respects them.
+  private mutating func collectDependentUses(of markDep: MarkDependenceInstruction) {
+    guard let dependence = LifetimeDependence(markDep, context) else {
+      hasUnboundedUse = true
+      return
+    }
+    // The walker only tracks ~Escapable and @noescape dependents; for anything else it reports
+    // success having collected nothing.
+    guard !dependence.dependentValue.mayEscape else {
+      hasUnboundedUse = true
+      return
+    }
+    var dependentUses = Stack<Instruction>(context)
+    defer { dependentUses.deinitialize() }
+    var walker = LifetimeDependentUseWalker(root.parentFunction, localReachabilityCache, context) {
+      dependentUses.push($0)
+      return .continueWalk
+    }
+    defer { walker.deinitialize() }
+    if walker.walkDown(dependence: dependence) == .abortWalk {
+      hasUnboundedUse = true
+    }
+    indirectUses.append(contentsOf: dependentUses)
+  }
+
+  private mutating func addDeinitBarriers(of root: Value) {
+    var liverange = InstructionRange(for: root, context)
+    defer { liverange.deinitialize() }
+
+    liverange.insert(contentsOf: consumes.users)
+    liverange.insert(contentsOf: uses.users)
+
+    collectDeinitBarriers(into: &indirectUses, liverange: liverange,
+      lifetimeLimits: lifetimeLimits, def: root, context)
+  }
+
+  // Compute the full range in which the root must be kept live.
+  func fullLiveRange() -> InstructionRange {
+    // TODO: cache this liverange to avoid recomputing it for callers?
+    var liverange = InstructionRange(for: root, context)
+
+    // Omit the destroys from the liverange during copy resolution. They're hoisted afterwards.
+    liverange.insert(contentsOf: consumes.users)
+    liverange.insert(contentsOf: uses.users)
+    liverange.insert(contentsOf: indirectUses)  // Deinit barriers must be treated as uses.
+    if hasUnboundedUse {
+      // Liveness past an unbounded use is unknown, so the extend liveness to scope-ends.
+      liverange.insert(contentsOf: lifetimeLimits)
+    }
+    return liverange
+  }
+
+  // We do this by computing the LiveRange of only the non-destroy / non-scope-ending
+  // uses. This lets us see which consuming uses are within the live range, rather
+  // than on the boundary of its liveness (i.e., last use). Those inner consuming uses
+  // are exactly where copies are required.
+  //
+  //                  ┌─────────┐
+  //               ┌──┼ x = ... ┼──┐
+  //               │  └─────────┘  │
+  //               │               │
+  //            ┌──▼───────┐  ┌────▼─────┐
+  // boundary ─►│consume(x)│  │consume(x)│
+  //            └──────┬───┘  │use(x)    │◄─ boundary
+  //                   │      └─┬────────┘
+  //                   │        │
+  //                  ┌▼────────▼┐
+  //                  │destroy(x)│
+  //                  └──────────┘
+  //
+  //                       │  After copy resolution, consumes appear
+  //                       │  only on the boundary, if at all.
+  //                       ▼
+  //
+  //                  ┌─────────┐
+  //               ┌──┼ x = ... ┼──┐
+  //               │  └─────────┘  │
+  //               │               │
+  //            ┌──▼───────┐  ┌────▼──────┐
+  // boundary ─►│consume(x)│  │y = copy(x)│
+  //            └──────┬───┘  │consume(y) │
+  //                   │      │use(x)     │◄─ boundary
+  //                   │      └─┬─────────┘
+  //                   │        │
+  //                  ┌▼────────▼┐
+  //                  │destroy(x)│
+  //                  └──────────┘
+  //
+  // Crucially, the live range of certain roots includes deinit barriers,
+  // which causes some final consumes to need a copy anyway:
+  //
+  // Liveness before insertion for some lexical roots:
+  //       ┌─────────┐
+  //    ┌──┼ x = ... ┼──┐
+  //    │  └─────────┘  │
+  //    │               │
+  // ┌──▼───────┐  ┌────▼─────┐
+  // │consume(x)│  │use(x)    │
+  // └──────┬───┘  └─┬────────┘
+  //        │        │
+  //        │        │
+  //       ┌▼────────▼┐
+  //       │barrier() │ ◄─ liveness boundary of x
+  //       │destroy(x)│
+  //       └──────────┘
+  //
+  //
+  // Since the consume is interior with respect to this
+  // deinit-barrier extended liveness, it consumes a copy instead:
+  //        ┌─────────┐
+  //     ┌──┼ x = ... ┼──┐
+  //     │  └─────────┘  │
+  //     │               │
+  //  ┌──▼───────┐  ┌────▼─────┐
+  //  │y = copy x│  │use(x)    │
+  //  │consume(y)│  └─┬────────┘
+  //  └──────┬───┘    │
+  //         │        │
+  //        ┌▼────────▼┐
+  //        │barrier() │ ◄─ boundary
+  //        │destroy(x)│
+  //        └──────────┘
+  mutating func insertCopies() {
+    var liverange = fullLiveRange()
+    defer { liverange.deinitialize() }
+    log("liverange during insertCopies:\n\(liverange)")
+
+    // If there's no consumes, there's no copies to insert.
+    if consumes.isEmpty {
+      return
+    }
+
+    // Convert the set of *all* consumes into a set that only contains *boundary* consumes.
+    var boundaryConsumes: Stack<Operand> = Stack(context)
+    while let cons = consumes.pop() {
+      // TODO: how to handle consume and use within the same instruction efficiently?
+      // It's effectively when the instructions among the 'consumes' overlap with each other, or with any overlap with
+      // the instructions in the 'consumes' set.
+      if liverange.contains(cons.instruction) {
+        log("will insert a copy for operand: \(cons) to convert this into a non-consuming use: \(cons.instruction)")
+        replaceWithCopy(cons, context)
+        uses.append(cons)
+        continue
+      }
+
+      boundaryConsumes.push(cons)
+    }
+    consumes.deinitialize()
+    consumes = boundaryConsumes
+  }
+
+  // Insert destroy_value instructions along the boundary of the live range, anywhere the value
+  // would exit the live range unconsumed: block exits, after last uses with respect to deinit barriers.
+  func fixupDestroys() {
+    assert(root.ownership == .owned, "fixupDestroys for non-owned root: \(root)")
+
+    guard !hasUnboundedUse else {
+      // TODO: for now, trust SILGen's placement of destroy_value.
+      //  We probably should extend liveness until scope-ends.
+      log("not placing destroys: liveness is not bounded")
+      return
+    }
+
+    var liverange = fullLiveRange()
+    defer { liverange.deinitialize() }
+    log("liverange during fixupDestroys:\n\(liverange)")
+
+    // These are just the existing destroy_values that we might
+    // re-use if they're already in the right places.
+    var hoistableDestroys: InstructionSet = InstructionSet(context)
+    defer { hoistableDestroys.deinitialize() }
+    hoistableDestroys.insert(contentsOf: lifetimeLimits)
+
+    log("replacing destroys: \(hoistableDestroys)")
+    placeDestroys(of: root, atBoundaryOf: liverange, reusing: &hoistableDestroys, context)
+  }
+}
+
+
+fileprivate extension InstructionRange {
+  func alongBoundary(_ context: FunctionPassContext, insertFunc: (Builder) -> ()) {
+    for endInst in ends {
+      Builder.insert(after: endInst, context, insertFunc: insertFunc)
+    }
+    for exitBlock in exitBlocks {
+      let builder = Builder(atBeginOf: exitBlock, context)
+      insertFunc(builder)
+    }
+  }
+}
+
+
+
+// Collects all deinit barriers that exist on any path from the given lifetimeLimits towards the
+// definition, stopping at the boundary of `liverange`.
+private func collectDeinitBarriers(
+  into barriers: inout Stack<Instruction>,
+  liverange: InstructionRange,
+  lifetimeLimits: Stack<DestroyValueInst>,
+  def: Value,
+  _ context: FunctionPassContext
+) {
+  log("liverange during collectDeinitBarriers:\n\(liverange)")
+
+  let calleeAnalysis = context.calleeAnalysis
+  let defInst = def.definingInstruction
+  let defBlock = def.parentBlock
+
+  enum ScanResult {
+    case foundBarrier(Instruction)
+    case hitBoundary
+    case exhausted
+  }
+
+  // Scans backward within a single block, starting at (and including) `first`.
+  // A block argument has no defining instruction, so running out of instructions in its
+  // block is itself the boundary.
+  func scan(from first: Instruction?, in block: BasicBlock) -> ScanResult {
+    for inst in ReverseInstructionList(first: first) {
+      if inst == defInst || liverange.inclusiveRangeContains(inst) {
+        return .hitBoundary
+      }
+      if inst.isDeinitBarrier(calleeAnalysis) {
+        return .foundBarrier(inst)
+      }
+    }
+    return block == defBlock ? .hitBoundary : .exhausted
+  }
+
+  var worklist = BasicBlockWorklist(context)
+  defer { worklist.deinitialize() }
+
+  for destroy in lifetimeLimits {
+    // Scan the block containing this lifetime limit backwards, stopping the first time we find either
+    //  - a deinit barrier
+    //  - a current boundary of liveness
+    switch scan(from: destroy.previous, in: destroy.parentBlock) {
+    case .foundBarrier(let barrier):
+      barriers.append(barrier)
+      continue
+    case .hitBoundary:
+      continue
+    case .exhausted:
+      break
+    }
+
+    // If the same block had no barrier or liveness boundary; keep walking
+    // backward into unvisited predecessor blocks.
+    worklist.pushIfNotVisited(contentsOf: destroy.parentBlock.predecessors)
+
+    while let block = worklist.pop() {
+      switch scan(from: block.terminator, in: block) {
+      case .foundBarrier(let barrier):
+        barriers.append(barrier)
+      case .hitBoundary:
+        break
+      case .exhausted:
+        worklist.pushIfNotVisited(contentsOf: block.predecessors)
+      }
+    }
+  }
+}
+
+// Given an operand in the consume set, convert its use into a copy.
+private func replaceWithCopy(_ op: Operand, _ context: FunctionPassContext) {
+  let builder = Builder(before: op.instruction, context)
+  let copyValue = builder.createCopyValue(operand: op.value)
+
+  // If we're creating a copy of a noncopyable type, or forced to provide a copy
+  // to a `move_value [allows_diagnostics]`, then it must be diagnosed.
+  if op.value.type.isMoveOnly {
+    builder.createDiagnose(operand: copyValue, kind: .unpermittedCopy)
+  } else if let move = op.instruction as? MoveValueInst,
+            move.allowsDiagnostics {
+    builder.createDiagnose(operand: copyValue, kind: .unpermittedCopy)
+  }
+
+  op.set(to: copyValue, context)
+}
+
+private extension MutableCollection {
+  mutating func mutatingEach(_ body: (inout Element) -> Void) {
+    var i = startIndex
+    while i != endIndex {
+      body(&self[i])
+      i = index(after: i)
+    }
+  }
+}
+
+private extension Function {
+  // NOTE: This scans the entire function!
+  var exitingBlocks: LazyFilterSequence<BasicBlockList> {
+    return blocks.lazy.filter { $0.terminator.isFunctionExiting }
+  }
+}
+
+/// A "control" variable: a bit vector in memory, represented as an integer, tracking whether each field of a
+/// root is dynamically initialized. Bit `i` corresponds to leaf `i` of the root's FieldIndexTrie.
+private struct ControlVariable {
+  let address: Value
+  let intType: Type
+  let numBits: Int
+  let context: FunctionPassContext
+
+  init(for root: ResolvableRoot, numBits: Int, _ context: FunctionPassContext) {
+    guard numBits <= UInt.bitWidth else {
+      fatalError("TODO: control variable with more than \(UInt.bitWidth) bits")
+    }
+    let function = root.address.parentFunction
+    self.intType = context.getBuiltinIntegerType(bitWidth: numBits)
+    self.numBits = numBits
+    self.context = context
+
+    // Use an auto-generated location so the alloc_stack doesn't look like the storage of a user variable.
+    let loc = function.location.asAutoGenerated
+
+    // Create the control variable as the first instruction in the function so that it dominates all exits.
+    let entryBuilder = Builder(before: function.entryBlock.instructions.first!, location: loc, context)
+    self.address = entryBuilder.createAllocStack(intType)
+
+    // Initialize it at the root, which may be within a loop. An argument's root is the function entry.
+    let initBuilder: Builder
+    if let rootInst = root.address.definingInstruction {
+      initBuilder = Builder(before: rootInst, location: loc, context)
+    } else {
+      initBuilder = entryBuilder
+    }
+    let initial = initBuilder.createIntegerLiteral(root.startsInitialized ? Self.mask(of: 0..<numBits) : 0,
+                                                   type: intType)
+    initBuilder.createStore(source: initial, destination: address, ownership: .trivial)
+
+    // Deallocate before each function exit.
+    for block in function.exitingBlocks {
+      let exitBuilder = Builder(before: block.terminator, location: loc, context)
+      exitBuilder.createDeallocStack(address)
+    }
+  }
+
+  private static func mask(of range: Range<Int>) -> UInt {
+    let width = range.count
+    let ones: UInt = width == UInt.bitWidth ? ~0 : (1 << width) - 1
+    return ones << range.lowerBound
+  }
+
+  private func builder(before inst: Instruction) -> Builder {
+    Builder(before: inst, location: inst.location.asAutoGenerated, context)
+  }
+
+  /// Sets or clears the bits for `range`, just before `inst`.
+  func update(_ range: Range<Int>, initialized: Bool, before inst: Instruction) {
+    let builder = builder(before: inst)
+    let allBits = Self.mask(of: 0..<numBits)
+    let bits = Self.mask(of: range)
+
+    let newValue: Value
+    if bits == allBits {
+      newValue = builder.createIntegerLiteral(initialized ? allBits : 0, type: intType)
+    } else {
+      let oldValue = builder.createLoad(fromAddress: address, ownership: .trivial)
+      let operand = builder.createIntegerLiteral(initialized ? bits : allBits & ~bits, type: intType)
+      newValue = builder.createBuiltinBinaryFunction(name: initialized ? "or" : "and",
+                                                     operandType: intType, resultType: intType,
+                                                     arguments: [oldValue, operand])
+    }
+    builder.createStore(source: newValue, destination: address, ownership: .trivial)
+  }
+
+  /// Returns a `Builtin.Int1` that is true iff `bit` is set, computed just before `inst`.
+  func test(_ bit: Int, before inst: Instruction) -> Value {
+    let builder = builder(before: inst)
+    let value = builder.createLoad(fromAddress: address, ownership: .trivial)
+    if numBits == 1 {
+      return value
+    }
+    let boolType = context.getBuiltinIntegerType(bitWidth: 1)
+    let selected = builder.createBuiltinBinaryFunction(name: "and", operandType: intType, resultType: intType,
+      arguments: [value, builder.createIntegerLiteral(Self.mask(of: bit..<(bit + 1)), type: intType)])
+    return builder.createBuiltinBinaryFunction(name: "cmp_ne", operandType: intType, resultType: boolType,
+      arguments: [selected, builder.createIntegerLiteral(0, type: intType)])
+  }
+}
+
+let lifetimeResolutionResolveTest = FunctionTest("lifetime_resolution_resolve") {
+  function, arguments, context in
+  var resolver = Resolver(function, context)
+  var indexCache = FieldIndexTrieCache(for: function)
+  let root = arguments.takeValue()
+  resolver.resolve(root, &indexCache)
+}

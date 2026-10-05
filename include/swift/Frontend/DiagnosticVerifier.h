@@ -1,0 +1,378 @@
+//===--- DiagnosticVerifier.h - Diagnostic Verifier (-verify) ---*- C++ -*-===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+//
+// This file exposes support for the diagnostic verifier, which is used to
+// implement -verify mode in the compiler.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef SWIFT_FRONTEND_DIAGNOSTIC_VERIFIER_H
+#define SWIFT_FRONTEND_DIAGNOSTIC_VERIFIER_H
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/SourceMgr.h"
+#include "swift/AST/DiagnosticConsumer.h"
+#include "swift/Basic/LLVM.h"
+#include <optional>
+
+namespace {
+struct ExpectedDiagnosticInfo;
+}
+
+namespace swift {
+class DependencyTracker;
+class FileUnit;
+class SourceManager;
+class SourceFile;
+
+// MARK: - DependencyVerifier
+
+bool verifyDependencies(SourceManager &SM, ArrayRef<FileUnit *> SFs);
+bool verifyDependencies(SourceManager &SM, ArrayRef<SourceFile *> SFs);
+
+// MARK: - DiagnosticVerifier
+struct ExpectedFixIt;
+
+/// A range expressed in terms of line-and-column pairs.
+struct LineColumnRange {
+  unsigned StartLine, StartCol;
+  unsigned EndLine, EndCol;
+
+  LineColumnRange() : StartLine(0), StartCol(0), EndLine(0), EndCol(0) {}
+};
+
+class CapturedFixItInfo final {
+  SourceManager *diagSM;
+  DiagnosticInfo::FixIt FixIt;
+  mutable LineColumnRange LineColRange;
+
+public:
+  CapturedFixItInfo(SourceManager &diagSM, DiagnosticInfo::FixIt FixIt)
+    : diagSM(&diagSM), FixIt(FixIt) {}
+
+  CharSourceRange &getSourceRange() { return FixIt.getRange(); }
+  const CharSourceRange &getSourceRange() const { return FixIt.getRange(); }
+
+  StringRef getText() const { return FixIt.getText(); }
+
+  /// Obtain the line-column range corresponding to the fix-it's
+  /// replacement range.
+  const LineColumnRange &getLineColumnRange(SourceManager &SM) const;
+};
+
+struct CapturedDiagnosticInfo {
+  llvm::SmallString<128> Message;
+  unsigned SourceBufferID;
+  DiagnosticKind Classification;
+  SourceLoc Loc;
+  unsigned Line;
+  unsigned Column;
+  SmallVector<CapturedFixItInfo, 2> FixIts;
+  std::string CategoryDocFile;
+  /// Names of the diagnostic group and its parent groups, leaf-first.
+  std::vector<std::string> GroupNames;
+  // Original index into CapturedDiagnostics. Allows identifying it even as
+  // elements get erased.
+  size_t ID;
+  // ID of the parent CapturedDiagnosticInfo, set for child notes when
+  // VerifyChildNotes is enabled.
+  std::optional<size_t> ParentID;
+  bool HasChildren;
+
+  CapturedDiagnosticInfo(llvm::SmallString<128> Message,
+                         unsigned SourceBufferID,
+                         DiagnosticKind Classification, SourceLoc Loc,
+                         unsigned Line, unsigned Column,
+                         SmallVector<CapturedFixItInfo, 2> FixIts,
+                         const std::string &categoryDocFile,
+                         std::vector<std::string> groupNames, size_t ID,
+                         std::optional<size_t> ParentIdx, bool HasChildren)
+      : Message(Message), SourceBufferID(SourceBufferID),
+        Classification(Classification), Loc(Loc), Line(Line), Column(Column),
+        FixIts(FixIts), CategoryDocFile(categoryDocFile),
+        GroupNames(std::move(groupNames)), ID(ID), ParentID(ParentIdx),
+        HasChildren(HasChildren) {}
+};
+
+struct SMDiagnosticWithNotes {
+  llvm::SMDiagnostic Diag;
+  llvm::SmallVector<llvm::SMDiagnostic, 1> Notes;
+  SMDiagnosticWithNotes(llvm::SMDiagnostic &&Diag) : Diag(Diag) {}
+  SMDiagnosticWithNotes(llvm::SMDiagnostic &Diag) : Diag(std::move(Diag)) {}
+};
+
+/// This class implements support for -verify mode in the compiler.  It
+/// buffers up diagnostics produced during compilation, then checks them
+/// against expected-error markers in the source file.
+class DiagnosticVerifier : public DiagnosticConsumer {
+  SourceManager &SM;
+  std::vector<CapturedDiagnosticInfo> CapturedDiagnostics;
+  ArrayRef<unsigned> BufferIDs;
+  ArrayRef<std::string> AdditionalFilePaths;
+  bool AutoApplyFixes;
+  bool IgnoreUnknown;
+  bool IgnoreUnrelated;
+  bool IgnoreMacroLocationNote;
+  bool VerifyChildNotes;
+  bool UseColor;
+  ArrayRef<std::string> AdditionalExpectedPrefixes;
+
+public:
+  explicit DiagnosticVerifier(SourceManager &SM, ArrayRef<unsigned> BufferIDs,
+                              ArrayRef<std::string> AdditionalFilePaths,
+                              bool AutoApplyFixes, bool IgnoreUnknown,
+                              bool IgnoreUnrelated,
+                              bool IgnoreMacroLocationNote,
+                              bool VerifyChildNotes, bool UseColor,
+                              ArrayRef<std::string> AdditionalExpectedPrefixes)
+      : SM(SM), BufferIDs(BufferIDs), AdditionalFilePaths(AdditionalFilePaths),
+        AutoApplyFixes(AutoApplyFixes), IgnoreUnknown(IgnoreUnknown),
+        IgnoreUnrelated(IgnoreUnrelated),
+        IgnoreMacroLocationNote(IgnoreMacroLocationNote),
+        VerifyChildNotes(VerifyChildNotes), UseColor(UseColor),
+        AdditionalExpectedPrefixes(AdditionalExpectedPrefixes) {}
+
+  virtual void handleDiagnostic(SourceManager &SM,
+                                const DiagnosticInfo &Info) override;
+
+  virtual bool finishProcessing() override;
+
+private:
+  /// Result of verifying a file.
+  struct Result {
+    /// Were there any errors? All of the following are considered errors:
+    /// - Expected diagnostics that were not present
+    /// - Unexpected diagnostics that were present
+    /// - Errors in the definition of expected diagnostics
+    bool HadError;
+    bool HadUnexpectedDiag;
+
+    Result &operator |= (const Result &rhs) {
+      HadError |= rhs.HadError;
+      HadUnexpectedDiag |= rhs.HadUnexpectedDiag;
+      return *this;
+    }
+  };
+
+  void printDiagnostic(const llvm::SMDiagnostic &Diag) const;
+  void printDiagnostic(const SMDiagnosticWithNotes &Diag) const;
+
+  /// Check whether there were any diagnostics in files without expected
+  /// diagnostics
+  bool verifyUnrelated(
+      std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics) const;
+
+  std::vector<SMDiagnosticWithNotes> Errors;
+
+  /// verifyFile - After the file has been processed, check to see if we
+  /// got all of the expected diagnostics and check to see if there were any
+  /// unexpected ones.
+  Result verifyFile(unsigned BufferID);
+  bool parseTargetBufferName(StringRef &MatchStart, StringRef &Out, size_t &TextStartIdx);
+  unsigned parseExpectedDiagInfo(unsigned BufferID, StringRef MatchStart,
+                                 unsigned &PrevExpectedContinuationLine,
+                                 ExpectedDiagnosticInfo &Expected,
+                                 bool InExpansion = false);
+  void parseNestedExpectedDiagInfoBlock(
+      unsigned BufferID, StringRef MatchStartIn,
+      unsigned &PrevExpectedContinuationLine,
+      std::vector<ExpectedDiagnosticInfo> &NestedDiagsOut, size_t &End,
+      bool InExpansion = false);
+  void
+  verifyDiagnostics(std::vector<ExpectedDiagnosticInfo> &ExpectedDiagnostics,
+                    unsigned BufferID, std::optional<size_t> ParentID);
+  void verifyRemaining(std::vector<ExpectedDiagnosticInfo> &ExpectedDiagnostics,
+                       const char *FileStart);
+  void addError(const char *Loc, const Twine &message,
+                ArrayRef<llvm::SMFixIt> FixIts = {});
+  /// Add a note to the last error added.
+  void addNote(const char *Loc, const Twine &message);
+
+  /// Emit an "unexpected diagnostic produced" error for \p DiagIter, erase
+  /// its child notes (if \c VerifyChildNotes), and erase the diagnostic
+  /// itself. Returns the iterator past the erased element.
+  std::vector<CapturedDiagnosticInfo>::iterator
+  reportAndEraseUnexpected(
+      std::vector<CapturedDiagnosticInfo>::iterator DiagIter);
+
+  std::optional<LineColumnRange>
+  parseExpectedFixItRange(StringRef &Str, unsigned DiagnosticLineNo);
+
+  bool checkForFixIt(const std::vector<ExpectedFixIt> &ExpectedAlts,
+                     const CapturedDiagnosticInfo &D) const;
+
+  // Render the verifier syntax for a given set of fix-its.
+  std::string renderFixits(ArrayRef<CapturedFixItInfo> ActualFixIts,
+                           unsigned DiagnosticLineNo) const;
+
+  public:
+  /// Tracks the set of macro-expansion buffers produced at a single source
+  /// location. A location can drive several sibling expansions (e.g. multiple
+  /// peer macros on one declaration); their buffers are ordered so that each
+  /// expansion has a stable "expansion index" matching source order. The
+  /// verifier numbers 'expected-expansion' directives at a location in source
+  /// order and matches directive #k to expansion index #k.
+  class ExpansionContext {
+  public:
+    /// Ordering key for a sibling expansion: siblings sharing a source buffer
+    /// (peer macros, at any nesting depth) are compared by \c anchorOffset;
+    /// siblings in different buffers (a template method's per-instantiation
+    /// synthesized attributes) are compared by \c content.
+    struct ExpansionOrderKey {
+      /// Buffer the generating attribute lives in. Used only to tell whether
+      /// two siblings share a buffer, never to order them, so its unstable
+      /// numeric value does not affect the result.
+      unsigned anchorBufferID = 0;
+      /// Byte offset of the generating attribute within that buffer.
+      unsigned anchorOffset = 0;
+      /// Text of the expansion buffer.
+      StringRef content;
+
+      bool operator<(const ExpansionOrderKey &RHS) const {
+        if (anchorBufferID == RHS.anchorBufferID &&
+            anchorOffset != RHS.anchorOffset)
+          return anchorOffset < RHS.anchorOffset;
+        return content.compare(RHS.content) < 0;
+      }
+    };
+
+  private:
+    /// Produced sibling expansions as (orderKey, bufferID), kept sorted so the
+    /// expansion index follows ExpansionOrderKey. Equal keys fall back to
+    /// buffer-ID order.
+    SmallVector<std::pair<ExpansionOrderKey, unsigned>, 2> buffers;
+    /// Number of directives already routed to a buffer during verification.
+    size_t verifiedCount = 0;
+    /// Number of directives already routed to a buffer during parsing.
+    size_t parsedCount = 0;
+
+  public:
+    ExpansionContext() = default;
+
+    void addBuffer(unsigned ID, ExpansionOrderKey key) {
+      assert(verifiedCount == 0 && parsedCount == 0 &&
+             "added buffer after routing began");
+      for (const auto &Buffer : buffers)
+        if (Buffer.second == ID)
+          return;
+      buffers.emplace_back(key, ID);
+      llvm::sort(buffers);
+
+#ifndef NDEBUG
+      // operator< orders same-buffer siblings by offset and different-buffer
+      // siblings by content, which is a valid strict weak ordering only if the
+      // group never mixes the two -- i.e. anchor buffers are all equal or all
+      // distinct. Peer macros share a buffer; per-instantiation synthesized
+      // attributes are all distinct. Guard against a future role breaking this.
+      bool sawEqual = false, sawDistinct = false;
+      for (size_t I = 0, E = buffers.size(); I != E; ++I)
+        for (size_t J = I + 1; J != E; ++J) {
+          if (buffers[I].first.anchorBufferID ==
+              buffers[J].first.anchorBufferID)
+            sawEqual = true;
+          else
+            sawDistinct = true;
+        }
+      assert(!(sawEqual && sawDistinct) &&
+             "expansion siblings mix shared and distinct anchor buffers");
+#endif
+    }
+
+    size_t expansionIndex(unsigned ID) const {
+      for (size_t I = 0, E = buffers.size(); I != E; ++I)
+        if (buffers[I].second == ID)
+          return I;
+      llvm_unreachable("buffer not in expansion context");
+    }
+
+    // The buffer for the next 'expected-expansion' directive at this location
+    // during verification, in source order. Returns std::nullopt once every
+    // produced expansion has been claimed, so surplus directives are reported
+    // as "expected expansion not produced" rather than running off the end of
+    // the buffer list.
+    std::optional<unsigned> nextBuffer() {
+      if (verifiedCount >= buffers.size())
+        return std::nullopt;
+      return buffers[verifiedCount++].second;
+    }
+
+    // The buffer for the next 'expected-expansion' directive at this location
+    // during parsing, in source order. Because directives are numbered in the
+    // same order the verifier assigns expansion indices, this binds each
+    // block's '#name@N' markers to the specific sibling expansion that block
+    // targets. Returns std::nullopt when the directive has no corresponding
+    // produced expansion (the "not produced" case is diagnosed separately).
+    std::optional<unsigned> nextParseBuffer() {
+      if (parsedCount >= buffers.size())
+        return std::nullopt;
+      return buffers[parsedCount++].second;
+    }
+  };
+  private:
+  llvm::DenseMap<SourceLoc, ExpansionContext> Expansions;
+
+  struct MarkerLocation {
+    // nullopt: resolution of the buffer ID has been deferred
+    std::optional<unsigned> BufferID;
+    unsigned Line;
+  };
+
+  /// Map from location marker names to their buffer and line number.
+  /// Populated by scanForMarkers() before parsing expected diagnostics. Plain
+  /// '// #name' markers are recorded with their resolved location. Expansion-
+  /// relative '// #name@N' markers are recorded with a null buffer ID
+  /// until the enclosing expected-expansion block is parsed and
+  /// processExpansionMarkerDefinitions() binds them.
+  llvm::StringMap<MarkerLocation> LocationMarkers;
+
+  /// Definition sites (pointing at the '#') of expansion-relative markers
+  /// ("// #name@N") seen inside an expected-expansion block in the buffer being
+  /// verified. These are recorded whether or not the marker bound successfully.
+  /// Used to diagnose such markers that appear outside any expansion block.
+  llvm::SmallPtrSet<const char *, 4> ExpansionMarkerLocs;
+
+  /// Scan the buffer for location marker definitions ('// #name' and
+  /// '// #name@N') and register them in LocationMarkers.
+  void scanForMarkers(unsigned BufferID);
+
+  /// Handle location marker definitions found inside an expected-expansion
+  /// block whose interior text is \p BlockText. A plain "// #name" is banned;
+  /// an expansion-relative "// #name@N" is bound to line N of the expansion
+  /// buffer \p ExpansionBufferID.
+  void
+  processExpansionMarkerDefinitions(StringRef BlockText,
+                                    std::optional<unsigned> ExpansionBufferID);
+
+  /// Resolve '@#marker' references in \p Diags (and their children) whose
+  /// resolution was deferred because the marker is a '// #name@N' whose
+  /// enclosing expected-expansion block is parsed later in the file than the
+  /// reference. References whose marker could not be bound (e.g. the expansion
+  /// was not produced) are dropped; undefined markers are diagnosed earlier,
+  /// during parsing.
+  void resolveDeferredMarkers(std::vector<ExpectedDiagnosticInfo> &Diags);
+
+  /// Check whether any location marker is defined at the given buffer and line.
+  bool hasMarkerAtLine(unsigned BufferID, unsigned Line) const;
+
+  /// Report any remaining diagnostics on lines with markers that were deferred
+  /// during per-file verification. Returns true if any were found.
+  bool verifyDeferredMarkerDiagnostics();
+
+  void printRemainingDiagnostics() const;
+};
+
+} // end namespace swift
+
+#endif

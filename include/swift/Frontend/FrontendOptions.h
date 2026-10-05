@@ -1,0 +1,684 @@
+//===--- FrontendOptions.h --------------------------------------*- C++ -*-===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef SWIFT_FRONTEND_FRONTENDOPTIONS_H
+#define SWIFT_FRONTEND_FRONTENDOPTIONS_H
+
+#include "swift/AST/AttrKind.h"
+#include "swift/Basic/FileTypes.h"
+#include "swift/Basic/PathRemapper.h"
+#include "swift/Basic/Version.h"
+#include "swift/Frontend/FrontendInputsAndOutputs.h"
+#include "swift/Frontend/InputFile.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/StringMap.h"
+#include <optional>
+
+#include <set>
+#include <string>
+#include <vector>
+
+namespace llvm {
+  class MemoryBuffer;
+}
+
+namespace swift {
+enum class IntermoduleDepTrackingMode;
+
+/// Options for debugging the behavior of the frontend.
+struct CompilerDebuggingOptions {
+  /// Indicates whether or not the Clang importer should print statistics upon
+  /// termination.
+  bool PrintClangStats = false;
+
+  /// Indicates whether or not the availability scope trees built during
+  /// compilation should be dumped upon termination.
+  bool DumpAvailabilityScopes = false;
+
+  /// Indicates whether or not the Clang importer should dump lookup tables
+  /// upon termination.
+  bool DumpClangLookupTables = false;
+
+  bool DumpAbstractLayout = false;
+
+  /// Dump every hidden-type layout known to this compilation: those recorded
+  /// during the local module's compilation plus those deserialized from any
+  /// imported Swift modules.
+  bool DumpHiddenTypeLayouts = false;
+};
+
+/// Options for controlling the behavior of the frontend.
+class FrontendOptions {
+  friend class ArgsToFrontendOptionsConverter;
+public:
+
+  /// A list of arbitrary modules to import and make implicitly visible.
+  std::vector<std::pair<std::string, bool /*testable*/>>
+      ImplicitImportModuleNames;
+
+  FrontendInputsAndOutputs InputsAndOutputs;
+
+  void forAllOutputPaths(const InputFile &input,
+                         llvm::function_ref<void(StringRef)> fn) const;
+
+  bool isOutputFileDirectory() const;
+
+  /// A C header to import and make implicitly visible.
+  std::string ImplicitObjCHeaderPath;
+
+  /// A C pch to import and make implicitly visible.
+  std::string ImplicitObjCPCHPath;
+
+  /// Whether the imported C header or precompiled header is considered
+  /// an internal import (vs. the default, a public import).
+  bool ImportHeaderAsInternal = false;
+
+  /// The map of aliases and real names of imported or referenced modules.
+  llvm::StringMap<std::string> ModuleAliasMap;
+
+  /// The name of the module that the frontend is building.
+  std::string ModuleName;
+
+  /// The ABI name of the module that the frontend is building, to be used in
+  /// mangling and metadata.
+  std::string ModuleABIName;
+
+  /// The name of the library to link against when using this module.
+  std::string ModuleLinkName;
+
+  /// Module name to use when referenced in clients module interfaces.
+  std::string ExportAsName;
+
+  /// The public facing name of the module to build.
+  std::string PublicModuleName;
+
+  /// Arguments which should be passed in immediate mode.
+  std::vector<std::string> ImmediateArgv;
+
+  /// A list of arguments to forward to LLVM's option processing; this
+  /// should only be used for debugging and experimental features.
+  std::vector<std::string> LLVMArgs;
+
+  /// The path to output swift interface files for the compiled source files.
+  std::string DumpAPIPath;
+
+  /// The path to collect the group information for the compiled source files.
+  std::string GroupInfoPath;
+
+  /// The path to which we should store indexing data, if any.
+  std::string IndexStorePath;
+
+  /// The path to look in when loading a module interface file, to see if a
+  /// binary module has already been built for use by the compiler.
+  std::string PrebuiltModuleCachePath;
+
+  /// The path to output explicit module dependencies. Only relevant during
+  /// dependency scanning.
+  std::string ExplicitModulesOutputPath;
+
+  /// The path to output explicitly-built SDK module dependencies. Only relevant during
+  /// dependency scanning.
+  std::string ExplicitSDKModulesOutputPath;
+
+  /// The path to look in to find backup .swiftinterface files if those found
+  /// from SDKs are failing.
+  std::string BackupModuleInterfaceDir;
+
+  /// For these modules, we should prefer using Swift interface when importing them.
+  std::vector<std::string> PreferInterfaceForModules;
+
+  /// User-defined module version number.
+  llvm::VersionTuple UserModuleVersion;
+
+  /// The Swift compiler version number that would be used to synthesize
+  /// swiftinterface files and subsequently their swiftmodules.
+  version::Version SwiftInterfaceCompilerVersion;
+
+  /// A set of modules allowed to import this module.
+  std::set<std::string> AllowableClients;
+
+  /// Options for debugging the compiler.
+  CompilerDebuggingOptions CompilerDebuggingOpts;
+
+  /// Emit index data for imported serialized swift system modules.
+  bool IndexSystemModules = false;
+
+  /// Avoid emitting index data for imported clang modules (pcms).
+  bool IndexIgnoreClangModules = false;
+
+  /// If indexing system modules, don't index the stdlib.
+  bool IndexIgnoreStdlib = false;
+
+  /// Include local definitions/references in the index data.
+  bool IndexIncludeLocals = false;
+  
+  /// Whether to compress the record and unit files in the index store.
+  bool IndexStoreCompress = false;
+
+  bool SerializeDebugInfoSIL = false;
+  /// If building a module from interface, ignore compiler flags
+  /// specified in the swiftinterface.
+  bool ExplicitInterfaceBuild = false;
+
+  /// The module for which we should verify all of the generic signatures.
+  std::string VerifyGenericSignaturesInModule;
+
+  /// CacheReplay PrefixMap.
+  std::vector<std::pair<std::string, std::string>> CacheReplayPrefixMap;
+
+  /// Number of retry opening an input file if the previous opening returns
+  /// bad file descriptor error.
+  unsigned BadFileDescriptorRetryCount = 0;
+  enum class ActionType {
+    NoneAction,        ///< No specific action
+    Parse,             ///< Parse only
+    ResolveImports,    ///< Parse and resolve imports only
+    Typecheck,         ///< Parse and type-check only
+    DumpParse,         ///< Parse only and dump AST
+    DumpInterfaceHash, ///< Parse and dump the interface token hash.
+    DumpAST,           ///< Parse, type-check, and dump AST
+    PrintAST,          ///< Parse, type-check, and pretty-print AST
+    PrintASTDecl,      ///< Parse, type-check, and pretty-print AST declarations
+
+    /// Parse and dump scope map.
+    DumpScopeMaps,
+
+    EmitImportedModules, ///< Emit the modules that this one imports
+    EmitPCH,             ///< Emit PCH of imported bridging header
+
+    EmitSILGenOSSA, ///< SIL after SILGen's cleanup passes (complete OSSA).
+    EmitSILGen, ///< Emit raw SIL
+    EmitSIL,    ///< Emit canonical SIL
+
+    EmitModuleOnly, ///< Emit module only
+    MergeModules,   ///< Merge modules only
+
+    /// Build from a swiftinterface, as close to `import` as possible
+    CompileModuleFromInterface,
+    /// Same as CompileModuleFromInterface, but stopping after typechecking
+    TypecheckModuleFromInterface,
+
+    EmitSIBGen, ///< Emit serialized AST + raw SIL
+    EmitSIB,    ///< Emit serialized AST + canonical SIL
+
+    Immediate, ///< Immediate mode
+    REPL,      ///< REPL mode
+
+    EmitAssembly,   ///< Emit assembly
+    EmitLoweredSIL, ///< Emit lowered SIL before IRGen runs
+    EmitIRGen,      ///< Emit LLVM IR before LLVM optimizations
+    EmitIR,         ///< Emit LLVM IR after LLVM optimizations
+    EmitBC,         ///< Emit LLVM BC
+    EmitObject,     ///< Emit object file
+
+    DumpTypeInfo, ///< Dump IRGen type info
+
+    EmitPCM, ///< Emit precompiled Clang module from a module map
+    DumpPCM, ///< Dump information about a precompiled Clang module
+
+    EmitPolyglotAST, ///< Emit polyglot AST as JSON
+
+    ScanDependencies, ///< Scan dependencies of Swift source files
+    PrintVersion,     ///< Print version information.
+    PrintArguments,   ///< Print supported arguments of this compiler
+  };
+
+  /// Indicates the action the user requested that the frontend perform.
+  ActionType RequestedAction = ActionType::NoneAction;
+
+  enum class ParseInputMode {
+    Swift,
+    SwiftLibrary,
+    SwiftModuleInterface,
+    SIL,
+  };
+  ParseInputMode InputMode = ParseInputMode::Swift;
+
+  /// Indicates that the input(s) should be parsed as the Swift stdlib.
+  bool ParseStdlib = false;
+
+  /// Ignore .swiftsourceinfo file when trying to get source locations from module imported decls.
+  bool IgnoreSwiftSourceInfo = false;
+
+  /// When true, emitted module files will always contain options for the
+  /// debugger to use. When unset, the options will only be present if the
+  /// module appears to not be a public module.
+  std::optional<bool> SerializeOptionsForDebugging;
+  /// When true, generated .swiftsourceinfo files will apply prefix maps from
+  /// -file-prefix-map flag and use a 0 value for the last modified timestamp.
+  bool PrefixMapSourceInfo = false;
+
+  /// When true the debug prefix map entries will be applied to debugging
+  /// options before serialization. These can be reconstructed at debug time by
+  /// applying the inverse map in SearchPathOptions.SearchPathRemapper.
+  bool DebugPrefixSerializedDebuggingOptions = false;
+
+  /// When true, check if all required SwiftOnoneSupport symbols are present in
+  /// the module.
+  bool CheckOnoneSupportCompleteness = false;
+
+  /// The path to which we should output statistics files.
+  std::string StatsOutputDir;
+
+  /// Whether to enable timers tracking individual requests. This adds some
+  /// runtime overhead.
+  bool FineGrainedTimers = false;
+
+  /// Whether we are printing all stats even if they are zero.
+  bool PrintZeroStats = false;
+
+  /// Trace changes to stats to files in StatsOutputDir.
+  bool TraceStats = false;
+
+  /// Profile changes to stats to files in StatsOutputDir.
+  bool ProfileEvents = false;
+
+  /// Profile changes to stats to files in StatsOutputDir, grouped by source
+  /// entity.
+  bool ProfileEntities = false;
+
+  /// Indicates whether or not an import statement can pick up a Swift source
+  /// file (as opposed to a module file).
+  bool EnableSourceImport = false;
+
+  /// Indicates whether we are compiling for testing.
+  ///
+  /// \see ModuleDecl::isTestingEnabled
+  bool EnableTesting = false;
+
+  /// Indicates whether we are compiling for private imports.
+  ///
+  /// \see ModuleDecl::arePrivateImportsEnabled
+  bool EnablePrivateImports = false;
+
+  /// Indicates whether we add implicit dynamic.
+  ///
+  /// \see ModuleDecl::isImplicitDynamicEnabled
+  bool EnableImplicitDynamic = false;
+
+  /// If set, this module is part of a mixed Objective-C/Swift framework, and
+  /// the Objective-C half should implicitly be visible to the Swift sources.
+  bool ImportUnderlyingModule = false;
+
+  /// If set, the header provided in ImplicitObjCHeaderPath will be rewritten
+  /// by the Clang importer as part of semantic analysis.
+  bool ModuleHasBridgingHeader = false;
+
+  /// Generate reproducer.
+  bool GenReproducer = false;
+
+  /// Directory to generate reproducer.
+  std::string GenReproducerDir;
+
+  /// Indicates whether or not the frontend should print statistics upon
+  /// termination.
+  bool PrintStats = false;
+
+  /// Indicates whether standard help should be shown.
+  bool PrintHelp = false;
+
+  /// Indicates whether full help (including "hidden" options) should be shown.
+  bool PrintHelpHidden = false;
+
+  /// Indicates that the frontend should print the target triple and then
+  /// exit.
+  bool PrintTargetInfo = false;
+
+  /// Indicates that the frontend should print the static build configuration
+  /// information as JSON.
+  bool PrintBuildConfig = false;
+
+  /// Indicates that the frontend should print the supported features and then
+  /// exit.
+  bool PrintSupportedFeatures = false;
+
+  /// See the \ref SILOptions.EmitVerboseSIL flag.
+  bool EmitVerboseSIL = false;
+
+  /// See the \ref SILOptions.EmitSortedSIL flag.
+  bool EmitSortedSIL = false;
+
+  /// Specifies the collection mode for the intermodule dependency tracker.
+  /// Note that if set, the dependency tracker will be enabled even if no
+  /// output path is configured.
+  std::optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
+
+  /// Should we emit the cType when printing @convention(c) or no?
+  bool PrintFullConvention = false;
+
+  /// Should we serialize the hashes of dependencies (vs. the modification
+  /// times) when compiling a module interface?
+  bool SerializeModuleInterfaceDependencyHashes = false;
+
+  /// Should we warn if an imported module needed to be rebuilt from a
+  /// module interface file?
+  bool RemarkOnRebuildFromModuleInterface = false;
+
+  /// Should we lock .swiftinterface while generating .swiftmodule from it?
+  bool DisableInterfaceFileLock = false;
+
+  /// Should we enable the dependency verifier for all primary files known to this frontend?
+  bool EnableIncrementalDependencyVerifier = false;
+
+  /// The path of the swift-frontend executable.
+  std::string MainExecutablePath;
+
+  /// The directory path we should use when print #include for the bridging header.
+  /// By default, we include ImplicitObjCHeaderPath directly.
+  std::optional<std::string> BridgingHeaderDirForPrint;
+
+  /// Disable implicitly-built Swift modules because they are explicitly
+  /// built and provided to the compiler invocation.
+  bool DisableImplicitModules = false;
+
+  /// Disable building Swift modules from textual interfaces. This should be
+  /// for testing purposes only.
+  bool DisableBuildingInterface = false;
+
+  /// Is this frontend configuration of an interface dependency scan sub-invocation
+  bool DependencyScanningSubInvocation = false;
+
+  /// When performing a dependency scanning action, only identify and output all imports
+  /// of the main Swift module's source files.
+  bool ImportPrescan = false;
+
+  /// After performing a dependency scanning action, serialize the scanner's internal state.
+  bool SerializeDependencyScannerCache = false;
+
+  /// Load and re-use a prior serialized dependency scanner cache.
+  bool ReuseDependencyScannerCache = false;
+
+  /// Upon loading a prior serialized dependency scanner cache, filter out
+  /// dependency module information which is no longer up-to-date with respect
+  /// to input files of every given module.
+  bool ValidatePriorDependencyScannerCache = false;
+
+  /// The path at which to either serialize or deserialize the dependency scanner cache.
+  std::string SerializedDependencyScannerCachePath;
+
+  /// Emit dependency scanning related remarks.
+  bool EmitDependencyScannerRemarks = false;
+
+  /// Emit remarks indicating use of the serialized module dependency scanning cache.
+  bool EmitDependencyScannerCacheRemarks = false;
+
+  /// The path at which the dependency scanner can write generated files.
+  std::string ScannerOutputDir;
+
+  /// If the scanner output is written directly to the disk for debugging.
+  bool WriteScannerOutput = false;
+
+  /// Whether the dependency scanner invocation should resolve imports
+  /// to filesystem modules in parallel.
+  bool ParallelDependencyScan = true;
+
+  /// Whether the dependency scanning worker should share a single Clang
+  /// compiler instance across named module dependency queries.
+  bool ShareClangCompilerInstance = true;
+
+  /// When performing an incremental build, ensure that cross-module incremental
+  /// build metadata is available in any swift modules emitted by this frontend
+  /// job.
+  ///
+  /// This flag is currently only propagated from the driver to
+  /// any merge-modules jobs.
+  bool DisableCrossModuleIncrementalBuild = false;
+
+  /// Best effort to output a .swiftmodule regardless of any compilation
+  /// errors. SIL generation and serialization is skipped entirely when there
+  /// are errors. The resulting serialized AST may include errors types and
+  /// skip nodes entirely, depending on the errors involved.
+  bool AllowModuleWithCompilerErrors = false;
+
+  /// Whether or not the compiler must be strict in ensuring that implicit downstream
+  /// module dependency build tasks must inherit the parent compiler invocation's context,
+  /// such as `-Xcc` flags, etc.
+  bool StrictImplicitModuleContext = false;
+
+  /// Whether to downgrade all errors emitted in the module interface
+  /// verification phase to warnings. When this has no value, the blocklists
+  /// decide whether the module's interface verification errors are downgraded.
+  /// TODO: remove this after we fix all project-side warnings in the interface.
+  std::optional<bool> DowngradeInterfaceVerificationError;
+
+  /// True if the "-static" option is set.
+  bool Static = false;
+
+  /// True if building with -experimental-hermetic-seal-at-link. Turns on
+  /// dead-stripping optimizations assuming that all users of library code
+  /// are present at LTO time.
+  bool HermeticSealAtLink = false;
+
+  /// Disable using the sandbox when executing subprocesses.
+  bool DisableSandbox = false;
+
+  /// The different modes for validating TBD against the LLVM IR.
+  enum class TBDValidationMode {
+    Default,        ///< Do the default validation for the current platform.
+    None,           ///< Do no validation.
+    MissingFromTBD, ///< Only check for symbols that are in IR but not TBD.
+    All, ///< Check for symbols that are in IR but not TBD and TBD but not IR.
+  };
+
+  /// Compare the symbols in the IR against the TBD file we would generate.
+  TBDValidationMode ValidateTBDAgainstIR = TBDValidationMode::Default;
+
+  /// An enum with different modes for automatically crashing at defined times.
+  enum class DebugCrashMode {
+    None, ///< Don't automatically crash.
+    AssertAfterTypeChecking, ///< Automatically assert after type checking.
+    CrashAfterTypeChecking, ///< Automatically crash after type checking.
+  };
+
+  /// Indicates a debug crash mode for the frontend.
+  DebugCrashMode CrashMode = DebugCrashMode::None;
+
+  /// Line and column for each of the locations to be probed by
+  /// -dump-scope-maps.
+  SmallVector<std::pair<unsigned, unsigned>, 2> DumpScopeMapLocations;
+
+  /// The possible output formats supported for dumping ASTs.
+  enum class ASTFormat {
+    Default,                ///< S-expressions for debugging
+    DefaultWithDeclContext, ///< S-expressions with DeclContext hierarchy
+    JSON,                   ///< Structured JSON for analysis
+    JSONZlib,               ///< Like JSON, but zlib-compressed
+  };
+
+  /// The output format generated by the `-dump-ast` flag.
+  ASTFormat DumpASTFormat = ASTFormat::Default;
+
+  /// Determines whether the static or shared resource folder is used.
+  /// When set to `true`, the default resource folder will be set to
+  /// '.../lib/swift', otherwise '.../lib/swift_static'.
+  bool UseSharedResourceFolder = true;
+
+  enum class ClangHeaderExposeBehavior {
+    /// Expose all public declarations in the generated header.
+    AllPublic,
+    /// Expose declarations only when they have expose attribute.
+    HasExposeAttr,
+    /// Expose declarations only when they have expose attribute or are the
+    /// implicitly exposed Stdlib declarations.
+    HasExposeAttrOrImplicitDeps
+  };
+
+  /// Indicates which declarations should be exposed in the generated clang
+  /// header.
+  std::optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
+
+  // Include declarations that are at least as visible as the acces specified
+  // by -emit-clang-header-min-access
+  std::optional<AccessLevel> ClangHeaderMinAccess;
+
+  struct ClangHeaderExposedImportedModule {
+    std::string moduleName;
+    std::string headerName;
+  };
+
+  /// Indicates which imported modules have a generated header associated with
+  /// them that can be imported into the generated header for the current
+  /// module.
+  std::vector<ClangHeaderExposedImportedModule> clangHeaderExposedImports;
+
+  /// \return true if the given action only parses without doing other compilation steps.
+  static bool shouldActionOnlyParse(ActionType);
+
+  /// \return true if the given action requires the standard library to be
+  /// loaded before it is run.
+  static bool doesActionRequireSwiftStandardLibrary(ActionType);
+
+  /// \return true if the given action runs full semantic analysis over the
+  /// whole module, providing a fully typechecked main module.
+  static bool doesActionTypeCheckWholeModule(ActionType);
+
+  /// \return true if the given action requires input files to be provided.
+  static bool doesActionRequireInputs(ActionType action);
+
+  /// \return true if the given action performs end of pipeline actions.
+  static bool doesActionPerformEndOfPipelineActions(ActionType action);
+
+  /// \return true if the given action supports caching.
+  static bool supportCompilationCaching(ActionType action);
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Bridging PCH hash.
+  llvm::hash_code getPCHHashComponents() const {
+    return llvm::hash_value(0);
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Dependency Scanning hash.
+  llvm::hash_code getModuleScanningHashComponents() const {
+    return hash_combine(
+        ModuleName, ModuleABIName, ModuleLinkName, ImplicitObjCHeaderPath,
+        PrebuiltModuleCachePath,
+        llvm::hash_combine_range(ImplicitImportModuleNames.begin(),
+                                 ImplicitImportModuleNames.end()),
+        UserModuleVersion);
+  }
+
+  StringRef determineFallbackModuleName() const;
+
+  bool isCompilingExactlyOneSwiftFile() const {
+    return InputsAndOutputs.hasSingleInput() &&
+           InputMode == ParseInputMode::Swift;
+  }
+
+  const PrimarySpecificPaths &
+  getPrimarySpecificPathsForAtMostOnePrimary() const;
+  const PrimarySpecificPaths &
+      getPrimarySpecificPathsForPrimary(StringRef) const;
+
+  /// Retrieves the list of arbitrary modules to import and make implicitly
+  /// visible.
+  ArrayRef<std::pair<std::string, bool /*testable*/>>
+  getImplicitImportModuleNames() const {
+    return ImplicitImportModuleNames;
+  }
+
+  /// Whether we're configured to track system intermodule dependencies.
+  bool shouldTrackSystemDependencies() const;
+
+  /// Whether we are configured with -typecheck or -typecheck-module-from-interface actuin
+  bool isTypeCheckAction() const;
+
+  /// Whether to emit symbol graphs for the output module.
+  bool EmitSymbolGraph = false;
+
+  /// The directory to which we should emit a symbol graph JSON files.
+  /// It is valid whenever there are any inputs.
+  ///
+  /// These are JSON file that describes the public interface of a module for
+  /// curating documentation, separated into files for each module this module
+  /// extends.
+  ///
+  /// \sa SymbolGraphASTWalker
+  std::string SymbolGraphOutputDir;
+
+  /// Whether to emit doc comment information in symbol graphs for symbols
+  /// which are inherited through classes or default implementations.
+  bool SkipInheritedDocs = false;
+
+  /// Whether to include symbols with SPI information in the symbol graph.
+  bool IncludeSPISymbolsInSymbolGraph = false;
+
+  /// Whether to reuse a frontend (i.e. compiler instance) for multiple
+  /// compilations. This prevents ASTContext being freed.
+  bool ReuseFrontendForMultipleCompilations = false;
+
+  /// This is used to obfuscate the serialized search paths so we don't have
+  /// to encode the actual paths into the .swiftmodule file.
+  PathObfuscator serializedPathObfuscator;
+
+  /// Whether to run the job twice to check determinism.
+  bool DeterministicCheck = false;
+
+  /// Avoid printing actual module content into the ABI descriptor file.
+  /// This should only be used as a workaround when emitting ABI descriptor files
+  /// crashes the compiler.
+  bool emptyABIDescriptor = false;
+
+  /// Augment modular imports in any emitted ObjC headers with equivalent
+  /// textual imports
+  bool EmitClangHeaderWithNonModularIncludes = false;
+
+  /// When non-empty, the generated Objective-C header for a mixed-source module
+  /// imports the underlying Clang module's headers using quoted includes
+  /// spelled relative to this path, instead of assuming a framework-style
+  /// umbrella header named after the module.
+  std::string GeneratedHeaderUnderlyingModuleIncludeBase;
+
+  /// All block list configuration files to be honored in this compilation.
+  std::vector<std::string> BlocklistConfigFilePaths;
+
+  struct CustomAvailabilityDomains {
+    /// Domains defined with `-define-enabled-availability-domain=`.
+    llvm::SmallVector<std::string> EnabledDomains;
+    /// Domains defined with `-define-always-enabled-availability-domain=`.
+    llvm::SmallVector<std::string> AlwaysEnabledDomains;
+    /// Domains defined with `-define-disabled-availability-domain=`.
+    llvm::SmallVector<std::string> DisabledDomains;
+    /// Domains defined with `-define-dynamic-availability-domain=`.
+    llvm::SmallVector<std::string> DynamicDomains;
+  };
+
+  /// The collection of AvailabilityDomain definitions specified as arguments.
+  CustomAvailabilityDomains AvailabilityDomains;
+
+private:
+  static bool canActionEmitDependencies(ActionType);
+  static bool canActionEmitReferenceDependencies(ActionType);
+  static bool canActionEmitClangHeader(ActionType);
+  static bool canActionEmitLoadedModuleTrace(ActionType);
+  static bool canActionEmitModule(ActionType);
+  static bool canActionEmitModuleDoc(ActionType);
+  static bool canActionEmitModuleSummary(ActionType);
+  static bool canActionEmitInterface(ActionType);
+  static bool canActionEmitABIDescriptor(ActionType);
+  static bool canActionEmitAPIDescriptor(ActionType);
+  static bool canActionEmitConstValues(ActionType);
+  static bool canActionEmitModuleSemanticInfo(ActionType);
+
+public:
+  static bool doesActionGenerateSIL(ActionType);
+  static bool doesActionGenerateIR(ActionType);
+  static bool doesActionProduceOutput(ActionType);
+  static bool doesActionProduceTextualOutput(ActionType);
+  static bool doesActionBuildModuleFromInterface(ActionType);
+  static bool needsProperModuleName(ActionType);
+  static file_types::ID formatForPrincipalOutputFileForAction(ActionType);
+};
+
+}
+
+#endif
